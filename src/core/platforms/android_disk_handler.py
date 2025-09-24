@@ -7,7 +7,7 @@ import os
 import subprocess
 import logging
 import psutil
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import json
 
 try:
@@ -19,6 +19,7 @@ except ImportError:
 
 from .base_handler import BaseDiskHandler
 from ..models import DiskInfo
+from ..tool_manager import tool_manager
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +29,282 @@ class AndroidDiskHandler(BaseDiskHandler):
     def __init__(self):
         self.is_rooted = self._check_root_access()
         self.storage_manager = None
+        self.tool_manager = tool_manager
         self._init_storage_manager()
+
+    def detect_hpa_dco(self, device: str) -> Dict:
+        """
+        Detect Host Protected Area (HPA) and Device Configuration Overlay (DCO)
+        Returns dict with HPA/DCO detection results
+        """
+        hpa_dco_info = {
+            'hpa_detected': False,
+            'hpa_sectors': 0,
+            'dco_detected': False,
+            'dco_sectors': 0,
+            'native_max_sectors': 0,
+            'current_max_sectors': 0,
+            'accessible_sectors': 0,
+            'hidden_sectors': 0,
+            'detection_method': None,
+            'can_remove_hpa': False,
+            'can_remove_dco': False,
+            'error': None
+        }
+
+        try:
+            # Android detection requires root access for most methods
+            if not self.is_rooted:
+                hpa_dco_info['error'] = "Root access required for HPA/DCO detection on Android"
+                return hpa_dco_info
+
+            # Method 1: Use hdparm if available (some Android devices have it)
+            try:
+                hdparm_path = self.tool_manager.get_tool_path('hdparm')
+                if hdparm_path:
+                    # hdparm is available, use it
+                    cmd = ["su", "-c", f"{hdparm_path} -I {device}"]
+                    result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                else:
+                    # Try system hdparm as fallback
+                    result = subprocess.run(["su", "-c", "which hdparm"],
+                                          capture_output=True, text=True, timeout=5)
+                    if result.returncode != 0:
+                        result = subprocess.CompletedProcess([], 1)  # Skip this method
+                    else:
+                        cmd = ["su", "-c", f"hdparm -I {device}"]
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+
+                    if result.returncode == 0:
+                        output = result.stdout
+                        import re
+
+                        # Parse LBA sectors
+                        lba48_match = re.search(r'LBA48\s+user\s+addressable\s+sectors:\s+(\d+)', output)
+                        if lba48_match:
+                            hpa_dco_info['accessible_sectors'] = int(lba48_match.group(1))
+
+                        # Get native max address
+                        hdparm_cmd = hdparm_path if hdparm_path else "hdparm"
+                        cmd_native = ["su", "-c", f"{hdparm_cmd} -N {device}"]
+                        result_native = subprocess.run(cmd_native, capture_output=True, text=True, timeout=10)
+
+                        if result_native.returncode == 0:
+                            native_output = result_native.stdout
+                            native_match = re.search(r'max sectors\s+=\s+(\d+)/(\d+)', native_output)
+
+                            if native_match:
+                                current = int(native_match.group(1))
+                                native = int(native_match.group(2))
+
+                                hpa_dco_info['current_max_sectors'] = current
+                                hpa_dco_info['native_max_sectors'] = native
+
+                                # Detect HPA
+                                if native > current:
+                                    hpa_dco_info['hpa_detected'] = True
+                                    hpa_dco_info['hpa_sectors'] = native - current
+                                    hpa_dco_info['hidden_sectors'] = native - current
+                                    hpa_dco_info['can_remove_hpa'] = True
+                                    hpa_dco_info['detection_method'] = 'hdparm'
+            except:
+                pass
+
+            # Method 2: Check /sys/block for size discrepancies
+            if device.startswith('/dev/block/'):
+                device_name = os.path.basename(device)
+
+                # Get size from /sys/block
+                size_file = f"/sys/block/{device_name}/size"
+                cmd_size = ["su", "-c", f"cat {size_file}"]
+                result_size = subprocess.run(cmd_size, capture_output=True, text=True, timeout=5)
+
+                if result_size.returncode == 0:
+                    kernel_sectors = int(result_size.stdout.strip())
+
+                    if hpa_dco_info['accessible_sectors'] == 0:
+                        hpa_dco_info['accessible_sectors'] = kernel_sectors
+
+                    # Check partition table for hidden areas
+                    cmd_parts = ["su", "-c", f"cat /proc/partitions | grep {device_name}"]
+                    result_parts = subprocess.run(cmd_parts, capture_output=True, text=True, timeout=5)
+
+                    if result_parts.returncode == 0:
+                        lines = result_parts.stdout.strip().split('\n')
+                        total_partition_sectors = 0
+
+                        for line in lines:
+                            parts = line.split()
+                            if len(parts) >= 3:
+                                # Skip the main device entry
+                                if not parts[-1].endswith(device_name):
+                                    blocks = int(parts[2])
+                                    total_partition_sectors += blocks * 2  # blocks are 1KB, sectors are 512B
+
+                        # If kernel reports more sectors than partitions use, HPA might exist
+                        if kernel_sectors > total_partition_sectors and total_partition_sectors > 0:
+                            unused_sectors = kernel_sectors - total_partition_sectors
+                            if unused_sectors > 2048:  # More than 1MB unused
+                                hpa_dco_info['hpa_detected'] = True
+                                hpa_dco_info['hidden_sectors'] = unused_sectors
+                                hpa_dco_info['hpa_sectors'] = unused_sectors
+                                if not hpa_dco_info['detection_method']:
+                                    hpa_dco_info['detection_method'] = 'partition_analysis'
+
+            # Method 3: Use smartctl if available (some custom ROMs include it)
+            try:
+                smartctl_path = self.tool_manager.get_tool_path('smartctl')
+                if smartctl_path:
+                    cmd_smart = ["su", "-c", f"{smartctl_path} -i {device}"]
+                    result_smart = subprocess.run(cmd_smart, capture_output=True, text=True, timeout=10)
+                else:
+                    # Try system smartctl as fallback
+                    result = subprocess.run(["su", "-c", "which smartctl"],
+                                          capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        cmd_smart = ["su", "-c", f"smartctl -i {device}"]
+                        result_smart = subprocess.run(cmd_smart, capture_output=True, text=True, timeout=10)
+                    else:
+                        result_smart = subprocess.CompletedProcess([], 1)  # Skip this method
+
+                    if result_smart.returncode == 0:
+                        smart_output = result_smart.stdout
+                        import re
+
+                        capacity_match = re.search(r'User Capacity:.*\[(\d+) bytes\]', smart_output)
+                        if capacity_match:
+                            smart_bytes = int(capacity_match.group(1))
+                            smart_sectors = smart_bytes // 512
+
+                            if hpa_dco_info['accessible_sectors'] == 0:
+                                hpa_dco_info['accessible_sectors'] = smart_sectors
+                            elif smart_sectors < hpa_dco_info['accessible_sectors']:
+                                # SMART reports less than kernel, possible HPA
+                                hpa_dco_info['hpa_detected'] = True
+                                hpa_dco_info['hidden_sectors'] = hpa_dco_info['accessible_sectors'] - smart_sectors
+                                if not hpa_dco_info['detection_method']:
+                                    hpa_dco_info['detection_method'] = 'smartctl'
+            except:
+                pass
+
+            # Method 4: Direct block device IOCTL (Android-specific)
+            if device.startswith('/dev/block/'):
+                try:
+                    # Get block device size using BLKGETSIZE64 ioctl
+                    cmd_ioctl = ["su", "-c", f"blockdev --getsize64 {device}"]
+                    result_ioctl = subprocess.run(cmd_ioctl, capture_output=True, text=True, timeout=5)
+
+                    if result_ioctl.returncode == 0:
+                        device_bytes = int(result_ioctl.stdout.strip())
+                        device_sectors = device_bytes // 512
+
+                        if hpa_dco_info['current_max_sectors'] == 0:
+                            hpa_dco_info['current_max_sectors'] = device_sectors
+
+                        # Also get sector size to ensure accuracy
+                        cmd_sector = ["su", "-c", f"blockdev --getss {device}"]
+                        result_sector = subprocess.run(cmd_sector, capture_output=True, text=True, timeout=5)
+
+                        if result_sector.returncode == 0:
+                            sector_size = int(result_sector.stdout.strip())
+                            if sector_size != 512:
+                                # Recalculate with actual sector size
+                                device_sectors = device_bytes // sector_size
+                                hpa_dco_info['current_max_sectors'] = device_sectors
+
+                        if not hpa_dco_info['detection_method']:
+                            hpa_dco_info['detection_method'] = 'blockdev'
+                except:
+                    pass
+
+            # Check for eMMC-specific hidden areas (common on Android)
+            if 'mmc' in device or 'emmc' in device:
+                try:
+                    # Check for RPMB (Replay Protected Memory Block) partition
+                    cmd_rpmb = ["su", "-c", "ls -la /dev/block/mmcblk*rpmb"]
+                    result_rpmb = subprocess.run(cmd_rpmb, capture_output=True, text=True, timeout=5)
+
+                    if result_rpmb.returncode == 0 and 'rpmb' in result_rpmb.stdout:
+                        # RPMB exists, it's a hidden area but not traditional HPA
+                        hpa_dco_info['hpa_detected'] = True
+                        hpa_dco_info['hidden_sectors'] = 8192  # RPMB is typically 4MB
+                        hpa_dco_info['detection_method'] = 'emmc_rpmb'
+                        hpa_dco_info['error'] = "eMMC RPMB partition detected (hardware-protected area)"
+                except:
+                    pass
+
+            # Set final status
+            if not hpa_dco_info['detection_method'] and not hpa_dco_info['error']:
+                hpa_dco_info['error'] = "Unable to fully detect HPA/DCO on this Android device"
+
+        except Exception as e:
+            hpa_dco_info['error'] = f"Error detecting HPA/DCO: {str(e)}"
+
+        return hpa_dco_info
+
+    def remove_hpa(self, device: str) -> Tuple[bool, str]:
+        """
+        Remove Host Protected Area from disk on Android
+        WARNING: This requires root access and may void warranty
+        """
+        try:
+            if not self.is_rooted:
+                return False, "Root access required to remove HPA on Android"
+
+            # First detect HPA
+            hpa_info = self.detect_hpa_dco(device)
+
+            if not hpa_info['hpa_detected']:
+                return False, "No HPA detected on this device"
+
+            if not hpa_info['can_remove_hpa']:
+                return False, "Cannot remove HPA from this device (may be hardware-protected)"
+
+            # Try to use hdparm if available
+            hdparm_path = self.tool_manager.get_tool_path('hdparm')
+            if not hdparm_path:
+                # Try system hdparm as fallback
+                result = subprocess.run(["su", "-c", "which hdparm"],
+                                      capture_output=True, text=True, timeout=5)
+                if result.returncode != 0:
+                    return False, "hdparm not available - cannot remove HPA on this Android device"
+                hdparm_path = "hdparm"
+
+            # Use hdparm to remove HPA
+            native_max = hpa_info['native_max_sectors']
+            cmd = ["su", "-c", f"{hdparm_path} -N p{native_max} {device}"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+                if result.returncode == 0:
+                    # Verify HPA removal
+                    new_info = self.detect_hpa_dco(device)
+                    if not new_info['hpa_detected']:
+                        return True, f"Successfully removed HPA, exposed {hpa_info['hpa_sectors']} hidden sectors"
+                    else:
+                        return False, "HPA removal attempted but verification failed"
+                else:
+                    return False, f"Failed to remove HPA: {result.stderr}"
+
+        except Exception as e:
+            return False, f"Error removing HPA: {str(e)}"
+
+    def remove_dco(self, device: str) -> Tuple[bool, str]:
+        """
+        Remove Device Configuration Overlay from disk on Android
+        WARNING: This is extremely dangerous and may brick the device
+        """
+        try:
+            if not self.is_rooted:
+                return False, "Root access required to remove DCO on Android"
+
+            # DCO removal on Android is extremely risky
+            # Most Android devices don't have traditional DCO
+            # eMMC devices use different protection mechanisms
+
+            return False, "DCO removal not supported on Android devices due to risk of permanent damage"
+
+        except Exception as e:
+            return False, f"Error removing DCO: {str(e)}"
     
     def _check_root_access(self) -> bool:
         """Check if device has root access"""
@@ -318,13 +594,17 @@ class AndroidDiskHandler(BaseDiskHandler):
     def get_wipe_methods(self) -> List[str]:
         """Get available wiping methods for Android"""
         methods = ["quick"]
-        
+
         if self.is_rooted:
             methods.extend(["dd", "secure"])
-        
+
+            # Check for additional tools
+            if self.tool_manager.is_tool_available('hdparm'):
+                methods.append("hdparm")
+
         # SAF method is always available but requires app integration
         methods.append("saf")
-        
+
         return methods
     
     def is_disk_writable(self, device: str) -> bool:

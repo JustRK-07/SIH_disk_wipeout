@@ -328,13 +328,23 @@ class MainWindow:
             # Get available disks
             disks = self.disk_manager.get_available_disks()
             
+            # Get system disks for protection status
+            system_disks = self.disk_manager.get_system_disks()
+            
             for disk in disks:
                 # Format size
                 size_str = f"{disk.size // (1024**3)}GB" if disk.size > 0 else "Unknown"
                 
-                # Check if writable
+                # Check if writable and if it's a system disk
                 is_writable = self.disk_manager.is_disk_writable(disk.device)
-                status = "Writable" if is_writable else "Read-only"
+                is_system_disk = disk.device in system_disks
+                
+                if is_system_disk:
+                    status = "🔒 PROTECTED"
+                elif is_writable:
+                    status = "✅ Writable"
+                else:
+                    status = "❌ Read-only"
                 
                 # Insert into tree
                 item = self.disk_tree.insert('', 'end', values=(
@@ -344,6 +354,11 @@ class MainWindow:
                     disk.model,
                     status
                 ))
+                
+                # Color code system disks
+                if is_system_disk:
+                    self.disk_tree.set(item, 'Status', '🔒 PROTECTED')
+                    # You could add color coding here if needed
                 
                 # Store disk info in item
                 self.disk_tree.set(item, 'Device', disk.device)
@@ -415,16 +430,52 @@ Writable: {'Yes' if self.disk_manager.is_disk_writable(device) else 'No'}"""
             self._log(f"Error getting wipe methods: {e}")
     
     def _start_wipe(self):
-        """Start the disk wiping process"""
+        """Start the disk wiping process with enhanced safety checks"""
         if not self.selected_disk:
             messagebox.showwarning("Warning", "Please select a disk to wipe")
             return
         
-        # Confirm wipe operation
-        result = messagebox.askyesno("Confirm Wipe", 
-                                   f"Are you sure you want to wipe {self.selected_disk}?\n\n"
-                                   "This action cannot be undone!")
+        # Enhanced safety check - prevent wiping system disks
+        system_disks = self.disk_manager.get_system_disks()
+        if self.selected_disk in system_disks:
+            messagebox.showerror("CRITICAL ERROR", 
+                               f"🚨 SYSTEM DISK PROTECTION 🚨\n\n"
+                               f"The selected disk {self.selected_disk} is a SYSTEM DISK!\n"
+                               f"Wiping this disk would DESTROY YOUR OPERATING SYSTEM!\n\n"
+                               f"This operation is BLOCKED for your safety.\n"
+                               f"Please select a different disk.")
+            self._log(f"BLOCKED: Attempt to wipe system disk {self.selected_disk}")
+            return
+        
+        # Check if disk is writable
+        if not self.disk_manager.is_disk_writable(self.selected_disk):
+            messagebox.showerror("Error", 
+                               f"Cannot wipe {self.selected_disk}\n\n"
+                               f"This disk is not writable or is currently in use.\n"
+                               f"Please ensure the disk is unmounted and accessible.")
+            return
+        
+        # First confirmation with detailed warning
+        result = messagebox.askyesno("⚠️ CRITICAL WARNING", 
+                                   f"🚨 FINAL CONFIRMATION REQUIRED 🚨\n\n"
+                                   f"You are about to PERMANENTLY ERASE ALL DATA on:\n"
+                                   f"📀 Device: {self.selected_disk}\n\n"
+                                   f"⚠️ THIS ACTION CANNOT BE UNDONE!\n"
+                                   f"⚠️ ALL DATA WILL BE PERMANENTLY LOST!\n"
+                                   f"⚠️ Make sure you have backups if needed!\n\n"
+                                   f"Are you absolutely certain you want to continue?")
         if not result:
+            self._log("Wipe operation cancelled by user")
+            return
+        
+        # Second confirmation for extra safety
+        result2 = messagebox.askyesno("🔒 FINAL SAFETY CHECK", 
+                                    f"LAST CHANCE TO CANCEL!\n\n"
+                                    f"Type 'YES' to confirm you want to wipe:\n"
+                                    f"{self.selected_disk}\n\n"
+                                    f"This will destroy ALL data on this disk!")
+        if not result2:
+            self._log("Wipe operation cancelled at final confirmation")
             return
         
         # Get wipe parameters

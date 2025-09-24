@@ -35,9 +35,21 @@ class CLIInterface:
             elif args.command == 'info':
                 self._show_disk_info(args.device)
             elif args.command == 'wipe':
-                self._wipe_disk(args.device, args.method, args.passes, args.verify, args.force)
+                self._wipe_disk(args.device, args.method, args.passes, not args.no_verify, args.force)
             elif args.command == 'methods':
                 self._show_wipe_methods()
+            elif args.command == 'detect-hpa':
+                self._detect_hpa_dco(args.device)
+            elif args.command == 'remove-hpa':
+                self._remove_hpa(args.device, args.force)
+            elif args.command == 'remove-dco':
+                self._remove_dco(args.device, args.force)
+            elif args.command == 'wipe-full':
+                self._wipe_with_hpa_dco(args.device, args.method, args.passes,
+                                       not args.no_verify, args.remove_hpa,
+                                       args.remove_dco, args.force)
+            elif args.command == 'tools':
+                self._show_tool_info()
             else:
                 parser.print_help()
                 
@@ -92,9 +104,223 @@ Examples:
         
         # Methods command
         methods_parser = subparsers.add_parser('methods', help='Show available wipe methods')
-        
+
+        # HPA/DCO detection command
+        detect_parser = subparsers.add_parser('detect-hpa',
+                                             help='Detect HPA/DCO on a disk')
+        detect_parser.add_argument('device', help='Device path (e.g., /dev/sdb)')
+
+        # Remove HPA command
+        remove_hpa_parser = subparsers.add_parser('remove-hpa',
+                                                 help='Remove Host Protected Area from disk')
+        remove_hpa_parser.add_argument('device', help='Device path')
+        remove_hpa_parser.add_argument('-f', '--force', action='store_true',
+                                      help='Force removal without confirmation')
+
+        # Remove DCO command
+        remove_dco_parser = subparsers.add_parser('remove-dco',
+                                                 help='Remove Device Configuration Overlay from disk')
+        remove_dco_parser.add_argument('device', help='Device path')
+        remove_dco_parser.add_argument('-f', '--force', action='store_true',
+                                      help='Force removal without confirmation')
+
+        # Full wipe with HPA/DCO removal
+        full_wipe_parser = subparsers.add_parser('wipe-full',
+                                                help='Wipe disk with optional HPA/DCO removal')
+        full_wipe_parser.add_argument('device', help='Device path to wipe')
+        full_wipe_parser.add_argument('-m', '--method', default='secure',
+                                     help='Wipe method (default: secure)')
+        full_wipe_parser.add_argument('-p', '--passes', type=int, default=3,
+                                     help='Number of passes (default: 3)')
+        full_wipe_parser.add_argument('--no-verify', action='store_true',
+                                     help='Skip verification after wipe')
+        full_wipe_parser.add_argument('--remove-hpa', action='store_true',
+                                     help='Remove HPA before wiping')
+        full_wipe_parser.add_argument('--remove-dco', action='store_true',
+                                     help='Remove DCO before wiping (DANGEROUS)')
+        full_wipe_parser.add_argument('-f', '--force', action='store_true',
+                                     help='Force wipe without confirmation')
+
+        # Tools info command
+        tools_parser = subparsers.add_parser('tools',
+                                            help='Show tool availability and version info')
+
         return parser
     
+    def _detect_hpa_dco(self, device: str):
+        """Detect and display HPA/DCO information for a disk"""
+        print(f"\nDetecting HPA/DCO on {device}...")
+        print("=" * 50)
+
+        hpa_dco_info = self.disk_manager.detect_hpa_dco(device)
+
+        if hpa_dco_info.get('error'):
+            print(f"Error: {hpa_dco_info['error']}")
+            return
+
+        # Display detection results
+        print(f"Detection Method: {hpa_dco_info.get('detection_method', 'N/A')}")
+        print(f"\nSector Information:")
+        print(f"  Current Max Sectors: {hpa_dco_info.get('current_max_sectors', 0):,}")
+        print(f"  Native Max Sectors:  {hpa_dco_info.get('native_max_sectors', 0):,}")
+        print(f"  Accessible Sectors:  {hpa_dco_info.get('accessible_sectors', 0):,}")
+
+        if hpa_dco_info.get('hpa_detected'):
+            hidden_sectors = hpa_dco_info.get('hpa_sectors', 0)
+            hidden_gb = (hidden_sectors * 512) / (1024**3)
+            print(f"\n⚠️  HPA DETECTED!")
+            print(f"  Hidden Sectors: {hidden_sectors:,}")
+            print(f"  Hidden Size: {hidden_gb:.2f} GB")
+            print(f"  Can Remove: {'Yes' if hpa_dco_info.get('can_remove_hpa') else 'No'}")
+        else:
+            print(f"\n✓ No HPA detected")
+
+        if hpa_dco_info.get('dco_detected'):
+            dco_sectors = hpa_dco_info.get('dco_sectors', 0)
+            dco_gb = (dco_sectors * 512) / (1024**3)
+            print(f"\n⚠️  DCO DETECTED!")
+            print(f"  DCO Sectors: {dco_sectors:,}")
+            print(f"  DCO Size: {dco_gb:.2f} GB")
+            print(f"  Can Remove: {'Yes' if hpa_dco_info.get('can_remove_dco') else 'No'}")
+        else:
+            print(f"\n✓ No DCO detected")
+
+        print("\n" + "=" * 50)
+
+    def _remove_hpa(self, device: str, force: bool = False):
+        """Remove HPA from disk"""
+        if not force:
+            response = input(f"\n⚠️  WARNING: Removing HPA from {device} will expose hidden areas.\n"
+                           "This may contain sensitive data. Continue? (yes/no): ")
+            if response.lower() != 'yes':
+                print("Operation cancelled.")
+                return
+
+        print(f"\nRemoving HPA from {device}...")
+        success, message = self.disk_manager.remove_hpa(device)
+
+        if success:
+            print(f"✓ {message}")
+        else:
+            print(f"✗ {message}")
+
+    def _remove_dco(self, device: str, force: bool = False):
+        """Remove DCO from disk"""
+        if not force:
+            response = input(f"\n⚠️  DANGER: Removing DCO from {device} can permanently damage the disk!\n"
+                           "This operation is irreversible. Are you absolutely sure? (type 'YES I UNDERSTAND'): ")
+            if response != 'YES I UNDERSTAND':
+                print("Operation cancelled.")
+                return
+
+        print(f"\nRemoving DCO from {device}...")
+        success, message = self.disk_manager.remove_dco(device)
+
+        if success:
+            print(f"✓ {message}")
+        else:
+            print(f"✗ {message}")
+
+    def _wipe_with_hpa_dco(self, device: str, method: str, passes: int,
+                          verify: bool, remove_hpa: bool, remove_dco: bool, force: bool):
+        """Wipe disk with optional HPA/DCO removal"""
+        # First detect HPA/DCO
+        print(f"\nScanning {device} for hidden areas...")
+        hpa_dco_info = self.disk_manager.detect_hpa_dco(device)
+
+        warnings = []
+        if hpa_dco_info.get('hpa_detected'):
+            hidden_gb = (hpa_dco_info.get('hpa_sectors', 0) * 512) / (1024**3)
+            warnings.append(f"HPA detected: {hidden_gb:.2f}GB hidden")
+
+        if hpa_dco_info.get('dco_detected'):
+            dco_gb = (hpa_dco_info.get('dco_sectors', 0) * 512) / (1024**3)
+            warnings.append(f"DCO detected: {dco_gb:.2f}GB hidden")
+
+        if warnings:
+            print("\nWarnings:")
+            for warning in warnings:
+                print(f"  ⚠️  {warning}")
+
+        if not force:
+            print(f"\nYou are about to wipe {device}")
+            if remove_hpa:
+                print("  - HPA will be removed")
+            if remove_dco:
+                print("  - DCO will be removed (DANGEROUS!)")
+            print(f"  - Method: {method}")
+            print(f"  - Passes: {passes}")
+
+            response = input("\nThis will permanently destroy all data. Continue? (yes/no): ")
+            if response.lower() != 'yes':
+                print("Operation cancelled.")
+                return
+
+        print(f"\nStarting wipe operation...")
+        success, message = self.disk_manager.wipe_with_hpa_dco_removal(
+            device, method, passes, verify, remove_hpa, remove_dco
+        )
+
+        print("\nOperation Results:")
+        for line in message.split('\n'):
+            if 'success' in line.lower() or 'removed' in line.lower():
+                print(f"  ✓ {line}")
+            elif 'fail' in line.lower() or 'error' in line.lower():
+                print(f"  ✗ {line}")
+            else:
+                print(f"  {line}")
+
+        if success:
+            print("\n✓ Wipe operation completed successfully")
+        else:
+            print("\n✗ Wipe operation failed or partially completed")
+
+    def _show_tool_info(self):
+        """Show tool availability and version information"""
+        from ..core.tool_manager import tool_manager
+
+        print("\n🔧 Tool Availability Report")
+        print("=" * 50)
+
+        tool_info = tool_manager.get_tool_info()
+
+        print(f"System: {tool_info['system'].title()}")
+        print(f"Architecture: {tool_info['architecture']}")
+        print(f"Edition: {'Complete' if tool_info['is_complete_edition'] else 'Lite'}")
+
+        if tool_info['tools_directory']:
+            print(f"Tools Directory: {tool_info['tools_directory']}")
+
+        print("\nTool Status:")
+        print("-" * 30)
+
+        for tool_name, tool_data in tool_info['tools'].items():
+            status = "✅ Available" if tool_data['available'] else "❌ Missing"
+            print(f"{tool_name:12} {status}")
+
+            if tool_data['available']:
+                path_type = "Bundled" if tool_data['bundled_path'] and tool_data['path'] == tool_data['bundled_path'] else "System"
+                print(f"{'':14} Path: {tool_data['path']} ({path_type})")
+            else:
+                print(f"{'':14} System command: {tool_data['system_command']}")
+
+        # Show installation suggestions for missing tools
+        missing_tools = tool_manager.get_missing_tools()
+        if missing_tools and not tool_info['is_complete_edition']:
+            print("\n💡 Installation Suggestions:")
+            print("-" * 30)
+            suggestions = tool_manager.get_installation_suggestions()
+            for tool, suggestion in suggestions.items():
+                print(f"{tool}: {suggestion}")
+
+            print("\nAlternatively, use the Complete Edition for all tools pre-bundled.")
+        elif missing_tools and tool_info['is_complete_edition']:
+            print(f"\n⚠️  Some bundled tools are missing. Package may be corrupted.")
+        else:
+            print(f"\n✅ All tools available!")
+
+        print("\n" + "=" * 50)
+
     def _list_disks(self):
         """List available disks"""
         print("Available Disks:")
@@ -172,15 +398,15 @@ Examples:
             print(f"Error: Device {device} is not writable")
             return
         
-        # Check if it's a system disk
+        # Enhanced safety check - prevent wiping system disks
         system_disks = self.disk_manager.get_system_disks()
         if device in system_disks:
-            print(f"Warning: {device} appears to be a system disk!")
-            if not force:
-                response = input("Are you sure you want to continue? (yes/no): ")
-                if response.lower() != 'yes':
-                    print("Operation cancelled")
-                    return
+            print(f"\n🚨 CRITICAL ERROR: SYSTEM DISK PROTECTION 🚨")
+            print(f"The selected disk {device} is a SYSTEM DISK!")
+            print(f"Wiping this disk would DESTROY YOUR OPERATING SYSTEM!")
+            print(f"This operation is BLOCKED for your safety.")
+            print(f"Please select a different disk.")
+            return
         
         # Confirmation
         if not force:

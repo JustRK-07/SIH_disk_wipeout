@@ -7,7 +7,7 @@ import os
 import subprocess
 import logging
 import psutil
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 import ctypes
 from ctypes import wintypes
 
@@ -20,14 +20,287 @@ except ImportError:
 
 from .base_handler import BaseDiskHandler
 from ..models import DiskInfo
+from ..tool_manager import tool_manager
 
 logger = logging.getLogger(__name__)
 
 class WindowsDiskHandler(BaseDiskHandler):
     """Windows-specific disk handler"""
     
+    def detect_hpa_dco(self, device: str) -> Dict:
+        """
+        Detect Host Protected Area (HPA) and Device Configuration Overlay (DCO)
+        Returns dict with HPA/DCO detection results
+        """
+        hpa_dco_info = {
+            'hpa_detected': False,
+            'hpa_sectors': 0,
+            'dco_detected': False,
+            'dco_sectors': 0,
+            'native_max_sectors': 0,
+            'current_max_sectors': 0,
+            'accessible_sectors': 0,
+            'hidden_sectors': 0,
+            'detection_method': None,
+            'can_remove_hpa': False,
+            'can_remove_dco': False,
+            'error': None
+        }
+
+        try:
+            # Extract disk number from device path
+            if "PhysicalDrive" not in device:
+                hpa_dco_info['error'] = "Invalid device path for HPA/DCO detection"
+                return hpa_dco_info
+
+            disk_num = device.split("PhysicalDrive")[1]
+
+            # Method 1: Use WMI to get disk capacity information
+            if self.wmi_conn:
+                try:
+                    for disk in self.wmi_conn.Win32_DiskDrive():
+                        if str(disk.Index) == disk_num:
+                            # Get reported size
+                            if disk.Size:
+                                hpa_dco_info['accessible_sectors'] = int(disk.Size) // 512
+
+                            # Try to get additional info from MSStorageDriver_ATAPISmartData
+                            try:
+                                smart_data = self.wmi_conn.query(
+                                    f"SELECT * FROM MSStorageDriver_FailurePredictData WHERE InstanceName LIKE '%{disk_num}%'"
+                                )
+                                if smart_data:
+                                    # Parse SMART data for hidden areas
+                                    pass
+                            except:
+                                pass
+                            break
+                except Exception as e:
+                    logger.debug(f"WMI query failed: {e}")
+
+            # Method 2: Use DeviceIoControl to get ATA IDENTIFY data
+            try:
+                import struct
+                import ctypes
+                from ctypes import wintypes, windll
+
+                # Open the physical drive
+                handle = ctypes.windll.kernel32.CreateFileW(
+                    device,
+                    0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                    0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+                    None,
+                    3,  # OPEN_EXISTING
+                    0,
+                    None
+                )
+
+                if handle != -1:
+                    # IOCTL_ATA_PASS_THROUGH
+                    IOCTL_ATA_PASS_THROUGH = 0x0004D02C
+
+                    # ATA IDENTIFY DEVICE command
+                    ATA_IDENTIFY_DEVICE = 0xEC
+
+                    # Structure for ATA pass through
+                    class ATA_PASS_THROUGH_EX(ctypes.Structure):
+                        _fields_ = [
+                            ("Length", ctypes.c_ushort),
+                            ("AtaFlags", ctypes.c_ushort),
+                            ("PathId", ctypes.c_ubyte),
+                            ("TargetId", ctypes.c_ubyte),
+                            ("Lun", ctypes.c_ubyte),
+                            ("ReservedAsUchar", ctypes.c_ubyte),
+                            ("DataTransferLength", ctypes.c_ulong),
+                            ("TimeOutValue", ctypes.c_ulong),
+                            ("ReservedAsUlong", ctypes.c_ulong),
+                            ("DataBufferOffset", ctypes.POINTER(ctypes.c_ubyte)),
+                            ("PreviousTaskFile", ctypes.c_ubyte * 8),
+                            ("CurrentTaskFile", ctypes.c_ubyte * 8)
+                        ]
+
+                    # Prepare the command
+                    ata_cmd = ATA_PASS_THROUGH_EX()
+                    ata_cmd.Length = ctypes.sizeof(ATA_PASS_THROUGH_EX)
+                    ata_cmd.AtaFlags = 0x02  # ATA_FLAGS_DATA_IN
+                    ata_cmd.DataTransferLength = 512
+                    ata_cmd.TimeOutValue = 10
+                    ata_cmd.CurrentTaskFile[6] = ATA_IDENTIFY_DEVICE
+
+                    # Buffer for IDENTIFY data
+                    identify_buffer = (ctypes.c_ubyte * 512)()
+                    bytes_returned = wintypes.DWORD()
+
+                    # Execute IOCTL
+                    success = windll.kernel32.DeviceIoControl(
+                        handle,
+                        IOCTL_ATA_PASS_THROUGH,
+                        ctypes.byref(ata_cmd),
+                        ctypes.sizeof(ata_cmd),
+                        ctypes.byref(identify_buffer),
+                        512,
+                        ctypes.byref(bytes_returned),
+                        None
+                    )
+
+                    if success:
+                        # Parse IDENTIFY data for LBA sectors
+                        # Words 60-61: Total number of user addressable sectors (LBA28)
+                        # Words 100-103: Total number of user addressable sectors (LBA48)
+
+                        # Extract LBA48 sector count (words 100-103)
+                        lba48_sectors = struct.unpack('<Q', bytes(identify_buffer[200:208]))[0]
+                        if lba48_sectors > 0:
+                            hpa_dco_info['current_max_sectors'] = lba48_sectors
+
+                        # Check for HPA support in IDENTIFY data
+                        # Word 82, bit 10: HPA feature set supported
+                        word82 = struct.unpack('<H', bytes(identify_buffer[164:166]))[0]
+                        hpa_supported = bool(word82 & 0x0400)
+
+                        if hpa_supported:
+                            # Try to get native max sectors
+                            # This would require sending READ NATIVE MAX ADDRESS command
+                            hpa_dco_info['detection_method'] = 'ata_identify'
+
+                    # Close handle
+                    windll.kernel32.CloseHandle(handle)
+
+            except Exception as e:
+                logger.debug(f"DeviceIoControl method failed: {e}")
+
+            # Method 3: Use diskpart utility to check for hidden sectors
+            try:
+                # Create a diskpart script
+                script = f"select disk {disk_num}\ndetail disk\nexit"
+                script_file = "temp_diskpart.txt"
+
+                with open(script_file, 'w') as f:
+                    f.write(script)
+
+                # Run diskpart
+                result = subprocess.run(
+                    ["diskpart", "/s", script_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+
+                if result.returncode == 0:
+                    output = result.stdout
+                    import re
+
+                    # Parse diskpart output for disk size
+                    size_match = re.search(r'Disk size\s*:\s*([\d.]+)\s*(GB|TB|MB)', output, re.IGNORECASE)
+                    if size_match:
+                        size_value = float(size_match.group(1))
+                        size_unit = size_match.group(2).upper()
+
+                        if size_unit == 'TB':
+                            size_bytes = size_value * 1024 * 1024 * 1024 * 1024
+                        elif size_unit == 'GB':
+                            size_bytes = size_value * 1024 * 1024 * 1024
+                        elif size_unit == 'MB':
+                            size_bytes = size_value * 1024 * 1024
+
+                        diskpart_sectors = int(size_bytes // 512)
+
+                        # Compare with accessible sectors
+                        if hpa_dco_info['accessible_sectors'] > 0 and diskpart_sectors > hpa_dco_info['accessible_sectors']:
+                            hpa_dco_info['hpa_detected'] = True
+                            hpa_dco_info['hidden_sectors'] = diskpart_sectors - hpa_dco_info['accessible_sectors']
+                            hpa_dco_info['hpa_sectors'] = hpa_dco_info['hidden_sectors']
+                            hpa_dco_info['detection_method'] = 'diskpart'
+
+                # Clean up
+                if os.path.exists(script_file):
+                    os.remove(script_file)
+
+            except Exception as e:
+                logger.debug(f"Diskpart method failed: {e}")
+
+            # Method 4: Check with PowerShell Get-Disk cmdlet
+            try:
+                cmd = f"powershell -Command \"Get-Disk -Number {disk_num} | Select-Object Size, AllocatedSize, LargestFreeExtent | ConvertTo-Json\""
+                result = subprocess.run(cmd, capture_output=True, text=True, shell=True, timeout=10)
+
+                if result.returncode == 0:
+                    import json
+                    disk_data = json.loads(result.stdout)
+
+                    if disk_data.get('Size'):
+                        ps_sectors = disk_data['Size'] // 512
+                        if hpa_dco_info['accessible_sectors'] == 0:
+                            hpa_dco_info['accessible_sectors'] = ps_sectors
+
+                        # Check for differences indicating hidden areas
+                        if disk_data.get('AllocatedSize') and disk_data['AllocatedSize'] < disk_data['Size']:
+                            unallocated = disk_data['Size'] - disk_data['AllocatedSize']
+                            if unallocated > 1024 * 1024 * 1024:  # More than 1GB unallocated
+                                hpa_dco_info['hpa_detected'] = True
+                                hpa_dco_info['hidden_sectors'] = unallocated // 512
+                                if not hpa_dco_info['detection_method']:
+                                    hpa_dco_info['detection_method'] = 'powershell'
+
+            except Exception as e:
+                logger.debug(f"PowerShell method failed: {e}")
+
+            # Set error if no detection method worked
+            if not hpa_dco_info['detection_method'] and not hpa_dco_info['error']:
+                hpa_dco_info['error'] = "Unable to detect HPA/DCO - may require additional tools or drivers"
+
+        except Exception as e:
+            hpa_dco_info['error'] = f"Error detecting HPA/DCO: {str(e)}"
+
+        return hpa_dco_info
+
+    def remove_hpa(self, device: str) -> Tuple[bool, str]:
+        """
+        Remove Host Protected Area from disk on Windows
+        Note: This requires specialized tools like HDAT2 or manufacturer utilities
+        """
+        try:
+            # First detect HPA
+            hpa_info = self.detect_hpa_dco(device)
+
+            if not hpa_info['hpa_detected']:
+                return False, "No HPA detected on this disk"
+
+            # On Windows, removing HPA typically requires:
+            # 1. Manufacturer-specific utilities (e.g., SeaTools, WD Data Lifeguard)
+            # 2. Third-party tools like HDAT2 or MHDD
+            # 3. Direct ATA commands via DeviceIoControl (complex implementation)
+
+            return False, "HPA removal on Windows requires specialized tools like HDAT2 or manufacturer utilities"
+
+        except Exception as e:
+            return False, f"Error removing HPA: {str(e)}"
+
+    def remove_dco(self, device: str) -> Tuple[bool, str]:
+        """
+        Remove Device Configuration Overlay from disk on Windows
+        Note: This requires specialized tools and is potentially dangerous
+        """
+        try:
+            # First detect DCO
+            dco_info = self.detect_hpa_dco(device)
+
+            if not dco_info['dco_detected']:
+                return False, "No DCO detected on this disk"
+
+            # DCO removal on Windows typically requires:
+            # 1. Specialized forensic tools
+            # 2. Direct ATA commands with proper driver support
+            # 3. Manufacturer-specific utilities
+
+            return False, "DCO removal on Windows requires specialized forensic tools or manufacturer utilities"
+
+        except Exception as e:
+            return False, f"Error removing DCO: {str(e)}"
+
     def __init__(self):
         self.wmi_conn = None
+        self.tool_manager = tool_manager
         if WMI_AVAILABLE:
             try:
                 self.wmi_conn = wmi.WMI()
@@ -102,7 +375,11 @@ class WindowsDiskHandler(BaseDiskHandler):
                             elif "NVME" in model.upper():
                                 disk_type = "nvme"
                             
-                            return DiskInfo(device, size, disk_type, model, serial)
+                            disk_info = DiskInfo(device, size, disk_type, model, serial)
+                            # Add HPA/DCO detection
+                            hpa_dco_info = self.detect_hpa_dco(device)
+                            disk_info.hpa_dco_info = hpa_dco_info
+                            return disk_info
             
             # Fallback
             return DiskInfo(device, 0, "unknown", "Unknown", "")
@@ -181,13 +458,18 @@ class WindowsDiskHandler(BaseDiskHandler):
     def get_wipe_methods(self) -> List[str]:
         """Get available wiping methods for Windows"""
         methods = ["cipher", "secure", "quick"]
-        # Add dd if available
+
+        # Check for available tools using tool manager
+        if self.tool_manager.is_tool_available('hdparm'):
+            methods.append("hdparm")
+
+        # Add dd if available (system check)
         try:
             subprocess.run(["where", "dd"], capture_output=True, check=True)
             methods.append("dd")
         except (subprocess.CalledProcessError, FileNotFoundError):
             pass
-        
+
         return methods
     
     def is_disk_writable(self, device: str) -> bool:

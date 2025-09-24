@@ -12,6 +12,15 @@ class DiskInfo:
         self.serial = serial
         self.mountpoint = ""
         self.filesystem = ""
-    
+        self.hpa_dco_info = None  # HPA/DCO detection results
+
     def __str__(self):
-        return f"{self.device} ({self.size // (1024**3)}GB) - {self.type.upper()}"
+        base_str = f"{self.device} ({self.size // (1024**3)}GB) - {self.type.upper()}"
+        if self.hpa_dco_info:
+            if self.hpa_dco_info.get('hpa_detected'):
+                hidden_gb = (self.hpa_dco_info.get('hpa_sectors', 0) * 512) // (1024**3)
+                base_str += f" [HPA: {hidden_gb}GB hidden]"
+            if self.hpa_dco_info.get('dco_detected'):
+                dco_gb = (self.hpa_dco_info.get('dco_sectors', 0) * 512) // (1024**3)
+                base_str += f" [DCO: {dco_gb}GB hidden]"
+        return base_str
