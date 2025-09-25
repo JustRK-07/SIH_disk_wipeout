@@ -117,7 +117,7 @@ class DiskManager:
         return self.handler.is_disk_writable(device)
     
     def _load_safety_config(self) -> Dict:
-        """Load safety configuration from file"""
+        """Load enhanced safety configuration from file"""
         config_path = Path(__file__).parent.parent.parent / "safety_config.json"
         default_config = {
             "protected_devices": [],
@@ -126,21 +126,58 @@ class DiskManager:
             "require_multiple_confirmations": True,
             "block_system_disks": True,
             "log_all_attempts": True,
-            "emergency_override": False
+            "emergency_override": False,
+            "safety_warnings": {
+                "show_hpa_dco_warnings": True,
+                "warn_about_hidden_areas": True,
+                "require_hpa_dco_confirmation": True,
+                "show_disk_health_warnings": True,
+                "warn_about_ssd_wear": True
+            },
+            "confirmation_levels": {
+                "standard_wipe": 2,
+                "hpa_removal": 3,
+                "dco_removal": 4,
+                "system_disk_attempt": 5
+            },
+            "logging": {
+                "log_safety_violations": True,
+                "log_confirmation_attempts": True,
+                "log_hpa_dco_operations": True,
+                "log_file_retention_days": 30
+            },
+            "advanced_protection": {
+                "check_disk_mount_status": True,
+                "verify_disk_ownership": True,
+                "check_for_active_processes": True,
+                "validate_wipe_parameters": True
+            }
         }
         
         try:
             if config_path.exists():
                 with open(config_path, 'r') as f:
                     config = json.load(f)
-                    logger.info(f"Loaded safety configuration from {config_path}")
-                    return {**default_config, **config}
+                    logger.info(f"Loaded enhanced safety configuration from {config_path}")
+                    # Deep merge configuration
+                    merged_config = self._deep_merge_config(default_config, config)
+                    return merged_config
             else:
-                logger.info("No safety config found, using defaults")
+                logger.info("No safety config found, using enhanced defaults")
                 return default_config
         except Exception as e:
             logger.error(f"Error loading safety config: {e}")
             return default_config
+    
+    def _deep_merge_config(self, default: Dict, user: Dict) -> Dict:
+        """Deep merge user configuration with defaults"""
+        result = default.copy()
+        for key, value in user.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = self._deep_merge_config(result[key], value)
+            else:
+                result[key] = value
+        return result
     
     def get_system_disks(self) -> List[str]:
         """Get list of system disks that should not be wiped"""
@@ -165,6 +202,61 @@ class DiskManager:
         """Check if a device is protected from wiping"""
         system_disks = self.get_system_disks()
         return device in system_disks
+    
+    def validate_wipe_operation(self, device: str, method: str, passes: int, 
+                              remove_hpa: bool = False, remove_dco: bool = False) -> Tuple[bool, List[str]]:
+        """
+        Enhanced validation for wipe operations
+        
+        Returns:
+            Tuple of (is_valid, list_of_warnings)
+        """
+        warnings = []
+        
+        # Basic protection check
+        if self.is_device_protected(device):
+            return False, [f"Device {device} is protected and cannot be wiped"]
+        
+        # Check if device is writable
+        if not self.is_disk_writable(device):
+            return False, [f"Device {device} is not writable"]
+        
+        # Advanced protection checks
+        if self.safety_config.get("advanced_protection", {}).get("check_disk_mount_status", True):
+            if self._is_disk_mounted(device):
+                warnings.append(f"Device {device} appears to be mounted")
+        
+        if self.safety_config.get("advanced_protection", {}).get("validate_wipe_parameters", True):
+            if passes < 1 or passes > 10:
+                warnings.append(f"Unusual number of passes: {passes}")
+            
+            if method not in self.get_wipe_methods():
+                warnings.append(f"Unknown wipe method: {method}")
+        
+        # HPA/DCO specific warnings
+        if self.safety_config.get("safety_warnings", {}).get("warn_about_hidden_areas", True):
+            hpa_dco_info = self.detect_hpa_dco(device)
+            if hpa_dco_info.get('hpa_detected') and not remove_hpa:
+                warnings.append(f"HPA detected: {hpa_dco_info.get('hpa_gb', 0):.1f}GB hidden")
+            if hpa_dco_info.get('dco_detected') and not remove_dco:
+                warnings.append(f"DCO detected: {hpa_dco_info.get('dco_gb', 0):.1f}GB hidden")
+        
+        # DCO removal warning
+        if remove_dco and self.safety_config.get("safety_warnings", {}).get("require_hpa_dco_confirmation", True):
+            warnings.append("DCO removal is DANGEROUS and can damage the disk")
+        
+        return True, warnings
+    
+    def _is_disk_mounted(self, device: str) -> bool:
+        """Check if a disk is currently mounted"""
+        try:
+            import psutil
+            for partition in psutil.disk_partitions():
+                if partition.device.startswith(device):
+                    return True
+            return False
+        except Exception:
+            return False
 
     def detect_hpa_dco(self, device: str) -> Dict:
         """

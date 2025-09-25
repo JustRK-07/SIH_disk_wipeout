@@ -1,0 +1,40 @@
+{
+    "protected_devices": [
+        "/dev/nvme0n1",
+        "/dev/sda"
+    ],
+    "protected_patterns": [
+        "nvme*",
+        "sda*"
+    ],
+    "additional_safety_checks": true,
+    "require_multiple_confirmations": true,
+    "block_system_disks": true,
+    "log_all_attempts": true,
+    "emergency_override": false,
+    "safety_warnings": {
+        "show_hpa_dco_warnings": true,
+        "warn_about_hidden_areas": true,
+        "require_hpa_dco_confirmation": true,
+        "show_disk_health_warnings": true,
+        "warn_about_ssd_wear": true
+    },
+    "confirmation_levels": {
+        "standard_wipe": 2,
+        "hpa_removal": 3,
+        "dco_removal": 4,
+        "system_disk_attempt": 5
+    },
+    "logging": {
+        "log_safety_violations": true,
+        "log_confirmation_attempts": true,
+        "log_hpa_dco_operations": true,
+        "log_file_retention_days": 30
+    },
+    "advanced_protection": {
+        "check_disk_mount_status": true,
+        "verify_disk_ownership": true,
+        "check_for_active_processes": true,
+        "validate_wipe_parameters": true
+    }
+}

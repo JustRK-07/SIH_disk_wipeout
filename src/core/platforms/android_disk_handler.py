@@ -275,15 +275,15 @@ class AndroidDiskHandler(BaseDiskHandler):
             cmd = ["su", "-c", f"{hdparm_path} -N p{native_max} {device}"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
 
-                if result.returncode == 0:
-                    # Verify HPA removal
-                    new_info = self.detect_hpa_dco(device)
-                    if not new_info['hpa_detected']:
-                        return True, f"Successfully removed HPA, exposed {hpa_info['hpa_sectors']} hidden sectors"
-                    else:
-                        return False, "HPA removal attempted but verification failed"
+            if result.returncode == 0:
+                # Verify HPA removal
+                new_info = self.detect_hpa_dco(device)
+                if not new_info['hpa_detected']:
+                    return True, f"Successfully removed HPA, exposed {hpa_info['hpa_sectors']} hidden sectors"
                 else:
-                    return False, f"Failed to remove HPA: {result.stderr}"
+                    return False, "HPA removal attempted but verification failed"
+            else:
+                return False, f"Failed to remove HPA: {result.stderr}"
 
         except Exception as e:
             return False, f"Error removing HPA: {str(e)}"
