@@ -31,10 +31,15 @@ class CertificateData:
     """Data structure for wipe certificate"""
     certificate_id: str
     timestamp: str
-    device_info: Dict[str, Any]
-    wipe_method: str
+    device_info: Dict[str, Any]  # manufacturer, model, serial, capacity
+    sanitization_method: str  # Clear / Purge / Destroy
+    exact_command: str  # e.g., nvme sanitize -a 2 /dev/nvme0n1
     passes: int
-    verification_status: str
+    verification_method: str
+    verification_result: str
+    operator_info: Dict[str, str]
+    supervisor_info: Dict[str, str]
+    tool_versions: Dict[str, str]  # e.g., nvme-cli v1.12, hdparm v9.66
     hash_algorithm: str
     certificate_hash: str
     issuer: str
@@ -117,9 +122,14 @@ class CertificateGenerator:
     
     def generate_certificate(self, 
                            device_info: Dict[str, Any],
-                           wipe_method: str,
+                           sanitization_method: str,
+                           exact_command: str,
                            passes: int,
-                           verification_status: str = "verified",
+                           verification_method: str = "hash_verification",
+                           verification_result: str = "verified",
+                           operator_info: Optional[Dict[str, str]] = None,
+                           supervisor_info: Optional[Dict[str, str]] = None,
+                           tool_versions: Optional[Dict[str, str]] = None,
                            metadata: Optional[Dict[str, Any]] = None,
                            disk_manager=None) -> CertificateData:
         """Generate a new wipe certificate with real data"""
@@ -136,14 +146,27 @@ class CertificateGenerator:
             # Merge with provided device_info, giving priority to real data
             device_info = {**device_info, **real_device_data}
         
+        # Set default values if not provided
+        if operator_info is None:
+            operator_info = {"name": "System Administrator", "id": "ADMIN-001"}
+        if supervisor_info is None:
+            supervisor_info = {"name": "IT Security Manager", "id": "SUPER-001"}
+        if tool_versions is None:
+            tool_versions = self._detect_tool_versions()
+        
         # Prepare certificate data
         cert_data = CertificateData(
             certificate_id=certificate_id,
             timestamp=timestamp,
             device_info=device_info,
-            wipe_method=wipe_method,
+            sanitization_method=sanitization_method,
+            exact_command=exact_command,
             passes=passes,
-            verification_status=verification_status,
+            verification_method=verification_method,
+            verification_result=verification_result,
+            operator_info=operator_info,
+            supervisor_info=supervisor_info,
+            tool_versions=tool_versions,
             hash_algorithm="SHA-256",
             certificate_hash="",  # Will be calculated
             issuer=self.issuer,
@@ -161,6 +184,45 @@ class CertificateGenerator:
         timestamp = int(time.time())
         random_part = secrets.token_hex(8)
         return f"SIH-{timestamp}-{random_part}"
+    
+    def _detect_tool_versions(self) -> Dict[str, str]:
+        """Detect versions of common disk sanitization tools"""
+        import subprocess
+        import shutil
+        
+        tool_versions = {}
+        
+        # Common tools to check
+        tools = {
+            'nvme-cli': 'nvme --version',
+            'hdparm': 'hdparm -V',
+            'dd': 'dd --version',
+            'shred': 'shred --version',
+            'wipefs': 'wipefs --version',
+            'sg_utils': 'sg_scan --version',
+            'smartctl': 'smartctl --version'
+        }
+        
+        for tool, version_cmd in tools.items():
+            try:
+                if shutil.which(tool.split()[0]):
+                    result = subprocess.run(version_cmd.split(), 
+                                          capture_output=True, text=True, timeout=5)
+                    if result.returncode == 0:
+                        # Extract version from output
+                        version_line = result.stdout.split('\n')[0]
+                        tool_versions[tool] = version_line.strip()
+                    else:
+                        tool_versions[tool] = "Available (version unknown)"
+                else:
+                    tool_versions[tool] = "Not installed"
+            except (subprocess.TimeoutExpired, subprocess.CalledProcessError, FileNotFoundError):
+                tool_versions[tool] = "Not available"
+        
+        # Add SIH Disk Wipeout version
+        tool_versions['sih-disk-wipeout'] = f"{self.version} ({self.issuer})"
+        
+        return tool_versions
     
     def _calculate_certificate_hash(self, cert_data: CertificateData) -> str:
         """Calculate SHA-256 hash of certificate data"""
@@ -235,19 +297,31 @@ Physical Location:       {cert_data.metadata.get('location', 'Not specified')}
 
 SANITIZATION DETAILS
 --------------------------------------------------------------------------------
-Sanitization Method:     {cert_data.wipe_method.upper()}
+Sanitization Method:     {cert_data.sanitization_method.upper()}
+Exact Command:           {cert_data.exact_command}
 Number of Passes:        {cert_data.passes}
-Verification Status:     {cert_data.verification_status.upper()}
+Verification Method:     {cert_data.verification_method}
+Verification Result:     {cert_data.verification_result.upper()}
 Hash Algorithm:          {cert_data.hash_algorithm}
 Sanitization Date:       {cert_data.timestamp.split('T')[0]}
 Sanitization Time:       {cert_data.timestamp.split('T')[1].split('+')[0]}
 
 PERSONNEL INFORMATION
 --------------------------------------------------------------------------------
-Operator:                {cert_data.metadata.get('operator', 'Not specified')}
-Supervisor:              {cert_data.metadata.get('supervisor', 'Not specified')}
+Operator Name:           {cert_data.operator_info.get('name', 'Not specified')}
+Operator ID:             {cert_data.operator_info.get('id', 'Not specified')}
+Supervisor Name:         {cert_data.supervisor_info.get('name', 'Not specified')}
+Supervisor ID:           {cert_data.supervisor_info.get('id', 'Not specified')}
 Organization:            {cert_data.issuer}
 
+TOOL VERSIONS
+--------------------------------------------------------------------------------
+"""
+        # Add tool versions
+        for tool, version in cert_data.tool_versions.items():
+            report += f"{tool.replace('-', ' ').title()}:           {version}\n"
+        
+        report += f"""
 COMPLIANCE INFORMATION
 --------------------------------------------------------------------------------
 Compliance Standard:     NIST SP 800-88 Rev. 1
@@ -429,9 +503,11 @@ END OF CERTIFICATE
         # Sanitization Details
         story.append(Paragraph("SANITIZATION DETAILS", heading_style))
         sanitization_data = [
-            ['Sanitization Method:', cert_data.wipe_method.upper()],
+            ['Sanitization Method:', cert_data.sanitization_method.upper()],
+            ['Exact Command:', cert_data.exact_command],
             ['Number of Passes:', str(cert_data.passes)],
-            ['Verification Status:', cert_data.verification_status.upper()],
+            ['Verification Method:', cert_data.verification_method],
+            ['Verification Result:', cert_data.verification_result.upper()],
             ['Hash Algorithm:', cert_data.hash_algorithm],
             ['Sanitization Date:', cert_data.timestamp.split('T')[0]],
             ['Sanitization Time:', cert_data.timestamp.split('T')[1].split('+')[0]]
@@ -450,8 +526,10 @@ END OF CERTIFICATE
         # Personnel Information
         story.append(Paragraph("PERSONNEL INFORMATION", heading_style))
         personnel_data = [
-            ['Operator:', cert_data.metadata.get('operator', 'Not specified')],
-            ['Supervisor:', cert_data.metadata.get('supervisor', 'Not specified')],
+            ['Operator Name:', cert_data.operator_info.get('name', 'Not specified')],
+            ['Operator ID:', cert_data.operator_info.get('id', 'Not specified')],
+            ['Supervisor Name:', cert_data.supervisor_info.get('name', 'Not specified')],
+            ['Supervisor ID:', cert_data.supervisor_info.get('id', 'Not specified')],
             ['Organization:', cert_data.issuer]
         ]
         personnel_table = Table(personnel_data, colWidths=[2*inch, 4*inch])
@@ -463,6 +541,23 @@ END OF CERTIFICATE
             ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
         ]))
         story.append(personnel_table)
+        story.append(Spacer(1, 12))
+        
+        # Tool Versions
+        story.append(Paragraph("TOOL VERSIONS", heading_style))
+        tool_data = []
+        for tool, version in cert_data.tool_versions.items():
+            tool_data.append([f"{tool.replace('-', ' ').title()}:", version])
+        
+        tool_table = Table(tool_data, colWidths=[2*inch, 4*inch])
+        tool_table.setStyle(TableStyle([
+            ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+            ('FONTNAME', (0, 0), (0, -1), 'Helvetica-Bold'),
+            ('FONTNAME', (1, 0), (1, -1), 'Helvetica'),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        story.append(tool_table)
         story.append(Spacer(1, 12))
         
         # Compliance Information
@@ -563,9 +658,11 @@ END OF CERTIFICATE
                 "is_writable": cert_data.device_info.get('is_writable', False)
             },
             "sanitization_details": {
-                "sanitization_method": cert_data.wipe_method.upper(),
+                "sanitization_method": cert_data.sanitization_method.upper(),
+                "exact_command": cert_data.exact_command,
                 "number_of_passes": cert_data.passes,
-                "verification_status": cert_data.verification_status.upper(),
+                "verification_method": cert_data.verification_method,
+                "verification_result": cert_data.verification_result.upper(),
                 "hash_algorithm": cert_data.hash_algorithm,
                 "sanitization_date": cert_data.timestamp.split('T')[0],
                 "sanitization_time": cert_data.timestamp.split('T')[1].split('+')[0],
@@ -573,10 +670,13 @@ END OF CERTIFICATE
                 "detection_timestamp": cert_data.device_info.get('detection_timestamp', '')
             },
             "personnel_information": {
-                "operator": cert_data.metadata.get('operator', 'Not specified'),
-                "supervisor": cert_data.metadata.get('supervisor', 'Not specified'),
+                "operator_name": cert_data.operator_info.get('name', 'Not specified'),
+                "operator_id": cert_data.operator_info.get('id', 'Not specified'),
+                "supervisor_name": cert_data.supervisor_info.get('name', 'Not specified'),
+                "supervisor_id": cert_data.supervisor_info.get('id', 'Not specified'),
                 "organization": cert_data.issuer
             },
+            "tool_versions": cert_data.tool_versions,
             "compliance_information": {
                 "compliance_standard": "NIST SP 800-88 Rev. 1",
                 "security_classification": cert_data.metadata.get('classification', 'Unclassified'),
@@ -640,12 +740,14 @@ if __name__ == "__main__":
             # Generate certificate with real data
             certificate = cert_gen.generate_certificate(
                 device_info={'device': test_device},  # Minimal info, will be filled with real data
-                wipe_method='secure',
+                sanitization_method='Purge',
+                exact_command=f'nvme sanitize -a 2 {test_device}',
                 passes=3,
-                verification_status='verified',
+                verification_method='hash_verification',
+                verification_result='verified',
+                operator_info={'name': 'System Administrator', 'id': 'ADMIN-001'},
+                supervisor_info={'name': 'IT Security Manager', 'id': 'SUPER-001'},
                 metadata={
-                    'operator': 'System Administrator',
-                    'supervisor': 'IT Security Manager',
                     'location': 'Data Center',
                     'classification': 'Confidential',
                     'sensitivity': 'High',

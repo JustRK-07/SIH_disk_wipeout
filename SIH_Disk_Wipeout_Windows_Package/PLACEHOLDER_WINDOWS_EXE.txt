@@ -1,0 +1,22 @@
+PLACEHOLDER FOR WINDOWS EXECUTABLE
+====================================
+
+This file is a placeholder for the Windows executable.
+
+To create the actual Windows .exe file:
+
+1. Follow the instructions in WINDOWS_BUILD_INSTRUCTIONS.md
+2. Replace this file with the actual SIH_Disk_Wipeout.exe
+3. The .exe file should be approximately 300-400MB in size
+
+Current Status:
+- Linux executable: ✅ Available (322MB)
+- Windows executable: ⏳ Pending (requires Windows machine)
+
+The Windows executable will be created when:
+- Building on a Windows machine, OR
+- Using Wine for cross-compilation, OR
+- Using GitHub Actions for automated builds
+
+Once created, users can simply double-click the .exe file to run
+the SIH Disk Wipeout software without any installation required.
