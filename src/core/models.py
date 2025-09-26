@@ -103,9 +103,16 @@ class DiskInfo:
     filesystem: str = ""
     hpa_dco_info: Optional[HPADCOInfo] = None
     health: Optional[DiskHealth] = None
-    status: DiskStatus = DiskStatus.AVAILABLE
+    status: Any = DiskStatus.AVAILABLE  # Can be DiskStatus enum or string
     is_writable: bool = True
     is_system_disk: bool = False
+    is_removable: bool = False
+    is_ssd: bool = False
+    is_mounted: bool = False
+    vendor: str = "Unknown"
+    mount_points: List[str] = field(default_factory=list)
+    hpa_detected: bool = False
+    dco_detected: bool = False
     last_updated: datetime.datetime = field(default_factory=datetime.datetime.now)
     
     @property
@@ -126,6 +133,8 @@ class DiskInfo:
         """Check if disk has hidden areas (HPA/DCO)"""
         if not self.hpa_dco_info:
             return False
+        if isinstance(self.hpa_dco_info, dict):
+            return self.hpa_dco_info.get('hpa_detected', False) or self.hpa_dco_info.get('dco_detected', False)
         return self.hpa_dco_info.hpa_detected or self.hpa_dco_info.dco_detected
     
     @property
@@ -133,6 +142,10 @@ class DiskInfo:
         """Get hidden capacity in GB"""
         if not self.hpa_dco_info:
             return 0.0
+        if isinstance(self.hpa_dco_info, dict):
+            hpa_sectors = self.hpa_dco_info.get('hpa_sectors', 0)
+            dco_sectors = self.hpa_dco_info.get('dco_sectors', 0)
+            return (hpa_sectors + dco_sectors) * 512 / (1024**3)
         return self.hpa_dco_info.hidden_gb
     
     @property
@@ -189,14 +202,25 @@ class DiskInfo:
         }
         
         if self.hpa_dco_info:
-            info.update({
-                "hpa_detected": self.hpa_dco_info.hpa_detected,
-                "dco_detected": self.hpa_dco_info.dco_detected,
-                "hpa_capacity": f"{self.hpa_dco_info.hpa_gb:.1f}GB",
-                "dco_capacity": f"{self.hpa_dco_info.dco_gb:.1f}GB",
-                "can_remove_hpa": self.hpa_dco_info.can_remove_hpa,
-                "can_remove_dco": self.hpa_dco_info.can_remove_dco
-            })
+            # Handle both dict and object formats
+            if isinstance(self.hpa_dco_info, dict):
+                info.update({
+                    "hpa_detected": self.hpa_dco_info.get('hpa_detected', False),
+                    "dco_detected": self.hpa_dco_info.get('dco_detected', False),
+                    "hpa_capacity": f"{self.hpa_dco_info.get('hpa_sectors', 0) * 512 / (1024**3):.1f}GB",
+                    "dco_capacity": f"{self.hpa_dco_info.get('dco_sectors', 0) * 512 / (1024**3):.1f}GB",
+                    "can_remove_hpa": self.hpa_dco_info.get('can_remove_hpa', False),
+                    "can_remove_dco": self.hpa_dco_info.get('can_remove_dco', False)
+                })
+            else:
+                info.update({
+                    "hpa_detected": self.hpa_dco_info.hpa_detected,
+                    "dco_detected": self.hpa_dco_info.dco_detected,
+                    "hpa_capacity": f"{self.hpa_dco_info.hpa_gb:.1f}GB",
+                    "dco_capacity": f"{self.hpa_dco_info.dco_gb:.1f}GB",
+                    "can_remove_hpa": self.hpa_dco_info.can_remove_hpa,
+                    "can_remove_dco": self.hpa_dco_info.can_remove_dco
+                })
         
         if self.health:
             info.update({

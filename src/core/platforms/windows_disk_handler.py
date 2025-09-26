@@ -19,7 +19,7 @@ except ImportError:
     logging.warning("WMI not available. Some disk information may be limited.")
 
 from .base_handler import BaseDiskHandler
-from ..models import DiskInfo
+from ..models import DiskInfo, DiskType
 from ..tool_manager import tool_manager
 
 logger = logging.getLogger(__name__)
@@ -321,11 +321,11 @@ class WindowsDiskHandler(BaseDiskHandler):
                     serial = disk.SerialNumber or ""
                     
                     # Determine disk type
-                    disk_type = "hdd"
+                    disk_type = DiskType.HDD
                     if "SSD" in model.upper() or "SOLID" in model.upper():
-                        disk_type = "ssd"
+                        disk_type = DiskType.SSD
                     elif "NVME" in model.upper():
-                        disk_type = "nvme"
+                        disk_type = DiskType.NVME
                     
                     disk_info = DiskInfo(device, size, disk_type, model, serial)
                     disks.append(disk_info)
@@ -341,7 +341,7 @@ class WindowsDiskHandler(BaseDiskHandler):
                         disk_info = DiskInfo(
                             partition.device,
                             usage.total,
-                            "unknown",
+                            DiskType.UNKNOWN,
                             "Unknown",
                             ""
                         )
@@ -369,24 +369,33 @@ class WindowsDiskHandler(BaseDiskHandler):
                             model = disk.Model or "Unknown"
                             serial = disk.SerialNumber or ""
                             
-                            disk_type = "hdd"
+                            disk_type = DiskType.HDD
                             if "SSD" in model.upper() or "SOLID" in model.upper():
-                                disk_type = "ssd"
+                                disk_type = DiskType.SSD
                             elif "NVME" in model.upper():
-                                disk_type = "nvme"
+                                disk_type = DiskType.NVME
                             
                             disk_info = DiskInfo(device, size, disk_type, model, serial)
-                            # Add HPA/DCO detection
-                            hpa_dco_info = self.detect_hpa_dco(device)
-                            disk_info.hpa_dco_info = hpa_dco_info
+                            # Add HPA/DCO detection (optional, may require admin privileges)
+                            try:
+                                hpa_dco_info = self.detect_hpa_dco(device)
+                                disk_info.hpa_dco_info = hpa_dco_info
+                            except Exception as e:
+                                logger.debug(f"HPA/DCO detection failed for {device}: {e}")
+                                # Provide default HPA/DCO info
+                                disk_info.hpa_dco_info = {
+                                    'hpa_detected': False,
+                                    'dco_detected': False,
+                                    'error': 'Detection requires admin privileges'
+                                }
                             return disk_info
             
             # Fallback
-            return DiskInfo(device, 0, "unknown", "Unknown", "")
+            return DiskInfo(device, 0, DiskType.UNKNOWN, "Unknown", "")
             
         except Exception as e:
             logger.error(f"Error getting disk info for {device}: {e}")
-            return DiskInfo(device, 0, "unknown", "Unknown", "")
+            return DiskInfo(device, 0, DiskType.UNKNOWN, "Unknown", "")
     
     def wipe_disk(self, device: str, method: str, passes: int) -> Tuple[bool, str]:
         """Wipe disk using Windows-specific methods"""
@@ -427,30 +436,205 @@ class WindowsDiskHandler(BaseDiskHandler):
             return False, f"Cipher.exe error: {e}"
     
     def _wipe_with_dd(self, device: str, passes: int) -> Tuple[bool, str]:
-        """Use dd-like approach with Python for secure wiping"""
+        """Use DeviceIoControl for secure wiping on Windows"""
         try:
-            # This is a simplified implementation
-            # In a real scenario, you'd need to use DeviceIoControl for low-level access
-            return False, "DD method requires low-level DeviceIoControl implementation"
+            import struct
+            import ctypes
+            from ctypes import wintypes, windll
+            
+            # Open the physical drive
+            handle = ctypes.windll.kernel32.CreateFileW(
+                device,
+                0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+                None,
+                3,  # OPEN_EXISTING
+                0,
+                None
+            )
+            
+            if handle == -1:
+                return False, "Failed to open device for writing"
+            
+            try:
+                # Get device size
+                device_size = self._get_device_size(handle)
+                if device_size == 0:
+                    return False, "Could not determine device size"
+                
+                # Perform multiple passes
+                for pass_num in range(passes):
+                    logger.info(f"Starting Windows DD wipe pass {pass_num + 1}/{passes}")
+                    
+                    # Create random data buffer (1MB chunks)
+                    chunk_size = 1024 * 1024
+                    random_data = os.urandom(chunk_size)
+                    
+                    # Write data in chunks
+                    bytes_written = 0
+                    while bytes_written < device_size:
+                        current_chunk_size = min(chunk_size, device_size - bytes_written)
+                        
+                        # Write the chunk
+                        bytes_written_ptr = wintypes.DWORD()
+                        success = ctypes.windll.kernel32.WriteFile(
+                            handle,
+                            random_data,
+                            current_chunk_size,
+                            ctypes.byref(bytes_written_ptr),
+                            None
+                        )
+                        
+                        if not success:
+                            return False, f"Write failed at pass {pass_num + 1}, offset {bytes_written}"
+                        
+                        bytes_written += bytes_written_ptr.value
+                        
+                        # Flush buffers
+                        ctypes.windll.kernel32.FlushFileBuffers(handle)
+                
+                return True, f"Windows DD wipe completed successfully with {passes} passes"
+                
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
             
         except Exception as e:
-            return False, f"DD wipe error: {e}"
+            return False, f"Windows DD wipe error: {e}"
     
     def _wipe_secure(self, device: str, passes: int) -> Tuple[bool, str]:
-        """Perform secure multi-pass wipe"""
+        """Perform secure multi-pass wipe using DeviceIoControl"""
         try:
-            # This would require DeviceIoControl implementation
-            # For now, return a placeholder
-            return False, "Secure wipe requires DeviceIoControl implementation"
+            import struct
+            import ctypes
+            from ctypes import wintypes, windll
+            
+            # Open the physical drive
+            handle = ctypes.windll.kernel32.CreateFileW(
+                device,
+                0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+                None,
+                3,  # OPEN_EXISTING
+                0,
+                None
+            )
+            
+            if handle == -1:
+                return False, "Failed to open device for secure wipe"
+            
+            try:
+                # Get device size
+                device_size = self._get_device_size(handle)
+                if device_size == 0:
+                    return False, "Could not determine device size"
+                
+                # Perform secure multi-pass wipe
+                for pass_num in range(passes):
+                    logger.info(f"Starting secure wipe pass {pass_num + 1}/{passes}")
+                    
+                    # Different patterns for each pass
+                    if pass_num == 0:
+                        # Pass 1: Write all zeros
+                        pattern = b'\x00'
+                    elif pass_num == 1:
+                        # Pass 2: Write all ones
+                        pattern = b'\xFF'
+                    else:
+                        # Pass 3+: Write random data
+                        pattern = os.urandom(1)
+                    
+                    # Write pattern in chunks
+                    chunk_size = 1024 * 1024
+                    pattern_data = pattern * chunk_size
+                    
+                    bytes_written = 0
+                    while bytes_written < device_size:
+                        current_chunk_size = min(chunk_size, device_size - bytes_written)
+                        
+                        # Write the chunk
+                        bytes_written_ptr = wintypes.DWORD()
+                        success = ctypes.windll.kernel32.WriteFile(
+                            handle,
+                            pattern_data,
+                            current_chunk_size,
+                            ctypes.byref(bytes_written_ptr),
+                            None
+                        )
+                        
+                        if not success:
+                            return False, f"Secure wipe failed at pass {pass_num + 1}, offset {bytes_written}"
+                        
+                        bytes_written += bytes_written_ptr.value
+                        
+                        # Flush buffers
+                        ctypes.windll.kernel32.FlushFileBuffers(handle)
+                
+                return True, f"Secure wipe completed successfully with {passes} passes"
+                
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
             
         except Exception as e:
             return False, f"Secure wipe error: {e}"
     
     def _wipe_quick(self, device: str) -> Tuple[bool, str]:
-        """Perform quick single-pass wipe"""
+        """Perform quick single-pass wipe using DeviceIoControl"""
         try:
-            # Quick wipe implementation
-            return False, "Quick wipe requires DeviceIoControl implementation"
+            import ctypes
+            from ctypes import wintypes, windll
+            
+            # Open the physical drive
+            handle = ctypes.windll.kernel32.CreateFileW(
+                device,
+                0x80000000 | 0x40000000,  # GENERIC_READ | GENERIC_WRITE
+                0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE
+                None,
+                3,  # OPEN_EXISTING
+                0,
+                None
+            )
+            
+            if handle == -1:
+                return False, "Failed to open device for quick wipe"
+            
+            try:
+                # Get device size
+                device_size = self._get_device_size(handle)
+                if device_size == 0:
+                    return False, "Could not determine device size"
+                
+                logger.info("Starting quick wipe (single pass with zeros)")
+                
+                # Write zeros in chunks
+                chunk_size = 1024 * 1024
+                zero_data = b'\x00' * chunk_size
+                
+                bytes_written = 0
+                while bytes_written < device_size:
+                    current_chunk_size = min(chunk_size, device_size - bytes_written)
+                    
+                    # Write the chunk
+                    bytes_written_ptr = wintypes.DWORD()
+                    success = ctypes.windll.kernel32.WriteFile(
+                        handle,
+                        zero_data,
+                        current_chunk_size,
+                        ctypes.byref(bytes_written_ptr),
+                        None
+                    )
+                    
+                    if not success:
+                        return False, f"Quick wipe failed at offset {bytes_written}"
+                    
+                    bytes_written += bytes_written_ptr.value
+                    
+                    # Flush buffers
+                    ctypes.windll.kernel32.FlushFileBuffers(handle)
+                
+                return True, "Quick wipe completed successfully"
+                
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
             
         except Exception as e:
             return False, f"Quick wipe error: {e}"
@@ -515,3 +699,47 @@ class WindowsDiskHandler(BaseDiskHandler):
             logger.error(f"Error getting system disks: {e}")
         
         return system_disks
+    
+    def _get_device_size(self, handle) -> int:
+        """Get the size of a device using DeviceIoControl"""
+        try:
+            import ctypes
+            from ctypes import wintypes, windll
+            
+            # IOCTL_DISK_GET_DRIVE_GEOMETRY_EX
+            IOCTL_DISK_GET_DRIVE_GEOMETRY_EX = 0x000700A0
+            
+            # DISK_GEOMETRY_EX structure
+            class DISK_GEOMETRY_EX(ctypes.Structure):
+                _fields_ = [
+                    ("Geometry", ctypes.c_byte * 24),  # DISK_GEOMETRY structure
+                    ("DiskSize", ctypes.c_ulonglong)
+                ]
+            
+            geometry = DISK_GEOMETRY_EX()
+            bytes_returned = wintypes.DWORD()
+            
+            success = windll.kernel32.DeviceIoControl(
+                handle,
+                IOCTL_DISK_GET_DRIVE_GEOMETRY_EX,
+                None,
+                0,
+                ctypes.byref(geometry),
+                ctypes.sizeof(geometry),
+                ctypes.byref(bytes_returned),
+                None
+            )
+            
+            if success:
+                return geometry.DiskSize
+            else:
+                # Fallback: try to get size using GetFileSize
+                high_size = wintypes.DWORD()
+                low_size = windll.kernel32.GetFileSize(handle, ctypes.byref(high_size))
+                if low_size != 0xFFFFFFFF or windll.kernel32.GetLastError() == 0:
+                    return (high_size.value << 32) | low_size
+                return 0
+                
+        except Exception as e:
+            logger.error(f"Error getting device size: {e}")
+            return 0

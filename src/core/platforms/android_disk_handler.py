@@ -18,7 +18,7 @@ except ImportError:
     logging.warning("JNIUS not available. Some Android features may be limited.")
 
 from .base_handler import BaseDiskHandler
-from ..models import DiskInfo
+from ..models import DiskInfo, DiskType
 from ..tool_manager import tool_manager
 
 logger = logging.getLogger(__name__)
@@ -530,7 +530,7 @@ class AndroidDiskHandler(BaseDiskHandler):
         except Exception as e:
             logger.error(f"Error getting disk info for {device}: {e}")
         
-        return DiskInfo(device, 0, "unknown", "Unknown", "")
+        return DiskInfo(device, 0, DiskType.UNKNOWN, "Unknown", "")
     
     def wipe_disk(self, device: str, method: str, passes: int) -> Tuple[bool, str]:
         """Wipe disk using Android-specific methods"""

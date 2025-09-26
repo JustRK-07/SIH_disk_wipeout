@@ -39,13 +39,15 @@ class EnhancedMainWindow:
         
         self._setup_window()
         self._create_modern_widgets()
-        self._refresh_disks()
         
         # Start progress monitoring
         progress_monitor.start_monitoring()
         
         # Register error handler callback
         error_handler.register_callback(self._on_error_occurred)
+        
+        # Initialize disk list after widgets are created
+        self._refresh_disks()
     
     def _get_theme_colors(self) -> Dict[str, str]:
         """Get color scheme based on current theme"""
@@ -100,6 +102,9 @@ class EnhancedMainWindow:
         
         # Set window icon and properties
         self.root.configure(bg=self.colors['bg_primary'])
+        
+        # Bind keyboard shortcuts
+        self._bind_keyboard_shortcuts()
         
     def _configure_modern_style(self):
         """Configure modern ttk styles"""
@@ -239,14 +244,24 @@ class EnhancedMainWindow:
         
         ttk.Label(list_header, text="Available Storage Devices", style='Heading.TLabel').grid(row=0, column=0, sticky=tk.W)
         
-        # Filter and search
-        filter_frame = ttk.Frame(list_header)
+        # Filter, search, and refresh controls
+        control_frame = ttk.Frame(list_header)
+        control_frame.grid(row=0, column=1, sticky=tk.E)
+        
+        # Refresh button in disk panel
+        refresh_disk_btn = ttk.Button(control_frame, text="🔄 Refresh Disks", 
+                                    command=self._refresh_disks_with_feedback, 
+                                    style='Secondary.TButton')
+        refresh_disk_btn.grid(row=0, column=0, padx=(0, 10))
+        
+        # Filter controls
+        filter_frame = ttk.Frame(control_frame)
         filter_frame.grid(row=0, column=1, sticky=tk.E)
         
         ttk.Label(filter_frame, text="Filter:", style='Info.TLabel').grid(row=0, column=0, padx=(0, 5))
         self.filter_var = tk.StringVar()
         filter_combo = ttk.Combobox(filter_frame, textvariable=self.filter_var, 
-                                   values=["All", "Writable", "Protected", "HDD", "SSD", "NVMe"],
+                                   values=["All", "Writable", "Protected", "HDD", "SSD", "NVMe", "USB/Removable"],
                                    state="readonly", width=12)
         filter_combo.set("All")
         filter_combo.grid(row=0, column=1)
@@ -487,14 +502,28 @@ class EnhancedMainWindow:
                 # Use enhanced data model properties
                 size_str = disk.size_formatted if hasattr(disk, 'size_formatted') else f"{disk.size // (1024**3)}GB"
                 
-                # Check status using enhanced model
-                is_writable = self.disk_manager.is_disk_writable(disk.device)
-                is_system_disk = disk.device in system_disks
+                # Get intelligent disk analysis
+                disk_status = self.disk_manager.get_disk_status_safe(disk.device)
+                is_writable = disk_status['is_writable']
+                is_system_disk = disk_status['is_protected']
+                safety_level = disk_status.get('safety_level', 'unknown')
+                role = disk_status.get('role', 'unknown')
+                interface = disk_status.get('interface', 'unknown')
+                confidence = disk_status.get('confidence_score', 0.0)
                 
-                # Determine status and health using enhanced model
-                if is_system_disk:
+                # Determine status and health using intelligent analysis
+                if safety_level == 'critical':
+                    status = "🚨 CRITICAL"
+                    health = "🔴 Boot Disk"
+                elif safety_level == 'dangerous':
                     status = "🔒 PROTECTED"
-                    health = "🟢 System"
+                    health = "🟠 System"
+                elif safety_level == 'warning':
+                    status = "⚠️ WARNING"
+                    health = "🟡 Data Disk"
+                elif safety_level == 'safe':
+                    status = "✅ SAFE"
+                    health = "🟢 Writable"
                 elif is_writable:
                     status = "✅ Writable"
                     health = "🟢 Good"
@@ -519,7 +548,8 @@ class EnhancedMainWindow:
                 usage_percentage = 0
                 if not is_system_disk:  # Don't show usage for system disks
                     # Simulate usage based on disk type and size
-                    if disk.type.lower() in ['ssd', 'nvme']:
+                    disk_type_str = disk.type.value if hasattr(disk.type, 'value') else str(disk.type)
+                    if disk_type_str.lower() in ['ssd', 'nvme']:
                         usage_percentage = 25  # SSDs typically have less usage
                     else:
                         usage_percentage = 45  # HDDs typically have more usage
@@ -554,11 +584,67 @@ class EnhancedMainWindow:
                 self.disk_tree.set(item, 'Device', disk.device)
             
             self._log(f"Found {len(disks)} disks")
-            self.status_bar_text.set(f"Found {len(disks)} disks")
+            if hasattr(self, 'status_bar_text'):
+                self.status_bar_text.set(f"Found {len(disks)} disks")
             
         except Exception as e:
             self._log(f"Error refreshing disks: {e}")
             messagebox.showerror("Error", f"Failed to refresh disk list: {e}")
+    
+    def _refresh_disks_with_feedback(self):
+        """Enhanced refresh with user feedback and progress indication"""
+        import threading
+        import time
+        
+        def refresh_worker():
+            try:
+                # Update status
+                self.root.after(0, lambda: self.status_bar_text.set("🔄 Refreshing disk list..."))
+                self.root.after(0, lambda: self._log("🔄 Refreshing disk list with enhanced feedback..."))
+                
+                # Small delay to show the refresh status
+                time.sleep(0.5)
+                
+                # Perform the actual refresh
+                self.root.after(0, self._refresh_disks)
+                
+                # Update status with completion
+                self.root.after(0, lambda: self.status_bar_text.set("✅ Disk list refreshed successfully"))
+                self.root.after(0, lambda: self._log("✅ Disk list refresh completed"))
+                
+            except Exception as e:
+                error_msg = f"Error during refresh: {e}"
+                self.root.after(0, lambda: self.status_bar_text.set(f"❌ {error_msg}"))
+                self.root.after(0, lambda: self._log(f"❌ {error_msg}"))
+                self.root.after(0, lambda: messagebox.showerror("Refresh Error", error_msg))
+        
+        # Run refresh in background thread to avoid UI blocking
+        refresh_thread = threading.Thread(target=refresh_worker, daemon=True)
+        refresh_thread.start()
+    
+    def _bind_keyboard_shortcuts(self):
+        """Bind keyboard shortcuts for common operations"""
+        # F5 or Ctrl+R for refresh
+        self.root.bind('<F5>', lambda e: self._refresh_disks_with_feedback())
+        self.root.bind('<Control-r>', lambda e: self._refresh_disks_with_feedback())
+        
+        # Escape to clear selection
+        self.root.bind('<Escape>', lambda e: self.disk_tree.selection_remove(self.disk_tree.selection()))
+        
+        # Ctrl+A to select all visible disks
+        self.root.bind('<Control-a>', lambda e: self._select_all_visible_disks())
+        
+        # Focus on disk tree with Tab
+        self.root.bind('<Tab>', lambda e: self.disk_tree.focus_set())
+        
+        self._log("⌨️ Keyboard shortcuts enabled: F5/Ctrl+R (Refresh), Esc (Clear), Ctrl+A (Select All)")
+    
+    def _select_all_visible_disks(self):
+        """Select all visible disks in the tree"""
+        visible_items = self.disk_tree.get_children()
+        if visible_items:
+            self.disk_tree.selection_set(visible_items)
+            self._log(f"Selected {len(visible_items)} visible disks")
     
     def _on_disk_select(self, event):
         """Handle disk selection with enhanced information"""
@@ -601,10 +687,10 @@ class EnhancedMainWindow:
         try:
             disk_info = self.disk_manager.get_disk_info(device)
             if disk_info:
-                # Get additional system information
-                system_disks = self.disk_manager.get_system_disks()
-                is_protected = device in system_disks
-                is_writable = self.disk_manager.is_disk_writable(device)
+                # Get additional system information using safe method
+                disk_status = self.disk_manager.get_disk_status_safe(device)
+                is_protected = disk_status['is_protected']
+                is_writable = disk_status['is_writable']
                 
                 # Use enhanced data model if available
                 if hasattr(disk_info, 'get_detailed_info'):
@@ -810,11 +896,12 @@ RECOMMENDATIONS
             disk_info = self.disk_manager.get_disk_info(device)
             if disk_info:
                 # Recommend method based on disk type
-                if disk_info.type.lower() == 'nvme':
+                disk_type_str = disk_info.type.value if hasattr(disk_info.type, 'value') else str(disk_info.type)
+                if disk_type_str.lower() == 'nvme':
                     recommended = "nvme - NVMe secure format (SSD-specific)"
-                elif disk_info.type.lower() == 'ssd':
+                elif disk_type_str.lower() == 'ssd':
                     recommended = "blkdiscard - TRIM-based discard (SSD-optimized)"
-                elif disk_info.type.lower() == 'hdd':
+                elif disk_type_str.lower() == 'hdd':
                     recommended = "hdparm - Linux hdparm secure erase (hardware-level)"
                 else:
                     recommended = "secure - Multi-pass secure wipe (recommended for sensitive data)"
@@ -948,37 +1035,17 @@ RECOMMENDATIONS
             if self.current_operation_id:
                 progress_monitor.update_progress(self.current_operation_id, 0, 0, "initializing")
             
-            # Simulate progress updates (in real implementation, this would come from the actual wipe operation)
-            disk_info = self.disk_manager.get_disk_info(device)
-            total_size = disk_info.size if disk_info else 0
-            
-            for pass_num in range(1, passes + 1):
-                if self.current_operation_id:
-                    progress_monitor.update_progress(
-                        self.current_operation_id, 0, pass_num, f"pass_{pass_num}"
-                    )
-                
-                # Simulate pass progress
-                for i in range(0, 101, 10):
-                    if self.current_operation_id:
-                        processed_size = int((total_size * i) / 100)
-                        speed = 50.0 + (i * 2)  # Simulate varying speed
-                        progress_monitor.update_progress(
-                            self.current_operation_id, processed_size, pass_num, 
-                            f"pass_{pass_num}", speed
-                        )
-                    time.sleep(0.1)  # Simulate work
-            
-            # Perform actual wipe (this would be the real implementation)
+            # Perform REAL wipe operation with automatic sudo handling
             if remove_hpa or remove_dco:
+                # Use HPA/DCO removal method
                 success, message = self.disk_manager.wipe_with_hpa_dco_removal(
                     device, method, passes, verify, remove_hpa, remove_dco
                 )
             else:
-                # Perform standard wipe
-                success, message = self.disk_manager.wipe_disk(device, method, passes, verify)
+                # Use sudo-enabled wipe method for seamless operation
+                success, message = self.disk_manager.wipe_disk_with_sudo(device, method, passes, verify)
             
-            # Complete operation in progress monitor
+            # Update progress monitor with completion
             if self.current_operation_id:
                 progress_monitor.complete_operation(self.current_operation_id, success, message)
             
@@ -1019,10 +1086,60 @@ RECOMMENDATIONS
         messagebox.showinfo("Info", "Stop functionality not yet implemented")
     
     def _filter_disks(self, event):
-        """Filter disks based on selection"""
+        """Filter disks based on selection with enhanced USB/Removable support"""
         filter_value = self.filter_var.get()
-        # Implementation for disk filtering
         self._log(f"Filtering disks by: {filter_value}")
+        
+        # Clear current selection
+        self.disk_tree.selection_remove(self.disk_tree.selection())
+        
+        # Get all items
+        all_items = self.disk_tree.get_children()
+        
+        # Show/hide items based on filter
+        for item in all_items:
+            values = self.disk_tree.item(item, 'values')
+            if not values:
+                continue
+                
+            device, size, disk_type, model, status, health, hidden, usage = values
+            
+            # Determine if item should be shown
+            show_item = True
+            
+            if filter_value == "All":
+                show_item = True
+            elif filter_value == "Writable":
+                show_item = "✅ Writable" in status
+            elif filter_value == "Protected":
+                show_item = "🔒 PROTECTED" in status
+            elif filter_value == "HDD":
+                show_item = "HDD" in disk_type.upper()
+            elif filter_value == "SSD":
+                show_item = "SSD" in disk_type.upper()
+            elif filter_value == "NVMe":
+                show_item = "NVME" in disk_type.upper()
+            elif filter_value == "USB/Removable":
+                # Check for USB/removable devices based on device path and model
+                is_usb = (
+                    "/dev/sd" in device or  # Common USB device paths
+                    "USB" in model.upper() or
+                    "FLASH" in model.upper() or
+                    "PENDRIVE" in model.upper() or
+                    "REMOVABLE" in model.upper() or
+                    "EXTERNAL" in model.upper()
+                )
+                show_item = is_usb and "🔒 PROTECTED" not in status
+            
+            # Show or hide the item
+            if show_item:
+                self.disk_tree.reattach(item, '', 'end')
+            else:
+                self.disk_tree.detach(item)
+        
+        # Update status
+        visible_count = len(self.disk_tree.get_children())
+        self.status_bar_text.set(f"Showing {visible_count} disks (filtered by: {filter_value})")
     
     def _show_quick_actions(self, device):
         """Show quick action menu for disk"""
@@ -1246,8 +1363,9 @@ RECOMMENDATIONS
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_message = f"[{timestamp}] {message}"
         
-        # Update status bar
-        self.status_bar_text.set(message)
+        # Update status bar if available
+        if hasattr(self, 'status_bar_text'):
+            self.status_bar_text.set(message)
         
         # Also log to file
         logger.info(message)
