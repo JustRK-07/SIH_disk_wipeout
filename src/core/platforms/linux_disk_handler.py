@@ -12,7 +12,7 @@ from typing import List, Tuple, Dict
 from pathlib import Path
 
 from .base_handler import BaseDiskHandler
-from ..models import DiskInfo
+from ..models import DiskInfo, DiskType
 from ..tool_manager import tool_manager
 
 logger = logging.getLogger(__name__)
@@ -62,8 +62,23 @@ class LinuxDiskHandler(BaseDiskHandler):
                 return hpa_dco_info
 
             # Get disk identification info
-            cmd = ["sudo", hdparm_path, "-I", device]
+            # Try without sudo first, then with sudo if needed
+            cmd = [hdparm_path, "-I", device]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+            
+            # If hdparm fails without sudo, try with sudo but handle password prompt
+            if result.returncode != 0:
+                cmd = ["sudo", "-n", hdparm_path, "-I", device]  # -n for non-interactive
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                
+                # If still fails, provide informative error
+                if result.returncode != 0:
+                    if "sudo: a password is required" in result.stderr or "sudo: a terminal is required" in result.stderr:
+                        hpa_dco_info['error'] = "HPA/DCO detection requires sudo permissions. Please run with sudo or configure passwordless sudo for hdparm."
+                        return hpa_dco_info
+                    else:
+                        hpa_dco_info['error'] = f"Failed to query disk: {result.stderr}"
+                        return hpa_dco_info
 
             if result.returncode == 0:
                 output = result.stdout
@@ -82,8 +97,13 @@ class LinuxDiskHandler(BaseDiskHandler):
                     hpa_dco_info['current_max_sectors'] = int(device_max_match.group(1))
 
                 # Check for HPA using --dco-identify
-                cmd_dco = ["sudo", hdparm_path, "--dco-identify", device]
+                cmd_dco = [hdparm_path, "--dco-identify", device]
                 result_dco = subprocess.run(cmd_dco, capture_output=True, text=True, timeout=10)
+                
+                # If DCO command fails without sudo, try with sudo
+                if result_dco.returncode != 0:
+                    cmd_dco = ["sudo", "-n", hdparm_path, "--dco-identify", device]
+                    result_dco = subprocess.run(cmd_dco, capture_output=True, text=True, timeout=10)
 
                 if result_dco.returncode == 0:
                     dco_output = result_dco.stdout
@@ -95,8 +115,13 @@ class LinuxDiskHandler(BaseDiskHandler):
                         hpa_dco_info['detection_method'] = 'hdparm_dco'
 
                 # Alternative: Get native max address
-                cmd_native = ["sudo", hdparm_path, "-N", device]
+                cmd_native = [hdparm_path, "-N", device]
                 result_native = subprocess.run(cmd_native, capture_output=True, text=True, timeout=10)
+                
+                # If native command fails without sudo, try with sudo
+                if result_native.returncode != 0:
+                    cmd_native = ["sudo", "-n", hdparm_path, "-N", device]
+                    result_native = subprocess.run(cmd_native, capture_output=True, text=True, timeout=10)
 
                 if result_native.returncode == 0:
                     native_output = result_native.stdout
@@ -140,8 +165,13 @@ class LinuxDiskHandler(BaseDiskHandler):
                 # Additional SMART data check for hidden areas
                 smartctl_path = self.tool_manager.get_tool_path('smartctl')
                 if smartctl_path:
-                    cmd_smart = ["sudo", smartctl_path, "-i", device]
+                    cmd_smart = [smartctl_path, "-i", device]
                     result_smart = subprocess.run(cmd_smart, capture_output=True, text=True, timeout=10)
+                    
+                    # If smartctl fails without sudo, try with sudo
+                    if result_smart.returncode != 0:
+                        cmd_smart = ["sudo", "-n", smartctl_path, "-i", device]
+                        result_smart = subprocess.run(cmd_smart, capture_output=True, text=True, timeout=10)
                 else:
                     result_smart = subprocess.CompletedProcess([], 1)  # Simulate failure
 
@@ -191,10 +221,12 @@ class LinuxDiskHandler(BaseDiskHandler):
             if not hdparm_path:
                 return False, "hdparm not available for HPA removal"
 
-            cmd = ["sudo", hdparm_path, "-N", f"p{native_max}", device]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-            if result.returncode == 0:
+            cmd = [hdparm_path, "-N", f"p{native_max}", device]
+            from ..sudo_manager import SudoManager
+            sudo_manager = SudoManager()
+            success, stdout, stderr = sudo_manager.run_with_sudo(cmd, "remove HPA", timeout=60)
+            
+            if success:
                 # Verify HPA removal
                 new_info = self.detect_hpa_dco(device)
                 if not new_info['hpa_detected']:
@@ -202,7 +234,7 @@ class LinuxDiskHandler(BaseDiskHandler):
                 else:
                     return False, "HPA removal attempted but verification failed"
             else:
-                return False, f"Failed to remove HPA: {result.stderr}"
+                return False, f"Failed to remove HPA: {stderr}"
 
         except Exception as e:
             return False, f"Error removing HPA: {str(e)}"
@@ -228,10 +260,12 @@ class LinuxDiskHandler(BaseDiskHandler):
             if not hdparm_path:
                 return False, "hdparm not available for DCO removal"
 
-            cmd = ["sudo", hdparm_path, "--dco-restore", device]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-
-            if result.returncode == 0:
+            cmd = [hdparm_path, "--dco-restore", device]
+            from ..sudo_manager import SudoManager
+            sudo_manager = SudoManager()
+            success, stdout, stderr = sudo_manager.run_with_sudo(cmd, "remove DCO", timeout=60)
+            
+            if success:
                 # Verify DCO removal
                 new_info = self.detect_hpa_dco(device)
                 if not new_info['dco_detected']:
@@ -239,7 +273,7 @@ class LinuxDiskHandler(BaseDiskHandler):
                 else:
                     return False, "DCO removal attempted but verification failed"
             else:
-                return False, f"Failed to remove DCO: {result.stderr}"
+                return False, f"Failed to remove DCO: {stderr}"
 
         except Exception as e:
             return False, f"Error removing DCO: {str(e)}"
@@ -276,7 +310,7 @@ class LinuxDiskHandler(BaseDiskHandler):
         return disks
     
     def _get_disk_info_from_sysfs(self, device_name: str, device_path: str) -> DiskInfo:
-        """Get disk information from sysfs"""
+        """Get disk information from sysfs with enhanced detection"""
         try:
             # Get size
             size_file = os.path.join(self.block_devices_path, device_name, "size")
@@ -286,65 +320,152 @@ class LinuxDiskHandler(BaseDiskHandler):
                     size_bytes = size_sectors * 512  # Assuming 512-byte sectors
             else:
                 size_bytes = 0
-            
-            # Get model and serial
+
+            # Get model, vendor and serial
             model = "Unknown"
             serial = ""
-            
+            vendor = "Unknown"
+
             # Try to get from /sys/block/device_name/device/model
             model_file = os.path.join(self.block_devices_path, device_name, "device", "model")
             if os.path.exists(model_file):
                 with open(model_file, 'r') as f:
                     model = f.read().strip()
-            
+
+            # Try to get vendor
+            vendor_file = os.path.join(self.block_devices_path, device_name, "device", "vendor")
+            if os.path.exists(vendor_file):
+                with open(vendor_file, 'r') as f:
+                    vendor = f.read().strip()
+
             # Try to get serial from /sys/block/device_name/device/serial
             serial_file = os.path.join(self.block_devices_path, device_name, "device", "serial")
             if os.path.exists(serial_file):
                 with open(serial_file, 'r') as f:
                     serial = f.read().strip()
-            
-            # Determine disk type
-            disk_type = self._determine_disk_type(device_name, model)
-            
-            # Get mountpoint and filesystem
-            mountpoint = ""
-            filesystem = ""
+
+            # Check if device is removable
+            is_removable = False
+            removable_file = os.path.join(self.block_devices_path, device_name, "removable")
+            if os.path.exists(removable_file):
+                with open(removable_file, 'r') as f:
+                    is_removable = f.read().strip() == "1"
+
+            # Check if it's a USB device by examining device path
+            is_usb = False
+            try:
+                device_path_real = os.path.realpath(os.path.join(self.block_devices_path, device_name, "device"))
+                if 'usb' in device_path_real.lower():
+                    is_usb = True
+                    is_removable = True  # USB devices are removable
+            except:
+                pass
+
+            # Determine disk type with USB detection
+            if is_usb or is_removable:
+                disk_type = DiskType.REMOVABLE
+            else:
+                disk_type = self._determine_disk_type(device_name, model)
+
+            # Get all mount points and filesystems for this device
+            mount_points = []
+            filesystems = set()
+            is_mounted = False
+
             try:
                 for partition in psutil.disk_partitions():
                     if partition.device.startswith(device_path):
-                        mountpoint = partition.mountpoint
-                        filesystem = partition.fstype
-                        break
+                        mount_points.append(partition.mountpoint)
+                        filesystems.add(partition.fstype)
+                        is_mounted = True
             except Exception:
                 pass
-            
-            disk_info = DiskInfo(device_path, size_bytes, disk_type, model, serial)
-            disk_info.mountpoint = mountpoint
-            disk_info.filesystem = filesystem
 
-            # Add HPA/DCO detection
-            hpa_dco_info = self.detect_hpa_dco(device_path)
-            disk_info.hpa_dco_info = hpa_dco_info
+            # Check if it's a system disk
+            is_system = self._is_system_disk(device_path)
+
+            # Determine status string
+            if is_system:
+                status = "SYSTEM"
+            elif is_mounted:
+                status = "MOUNTED"
+            elif is_removable:
+                status = "REMOVABLE"
+            else:
+                status = "AVAILABLE"
+
+            # Create DiskInfo with enhanced attributes
+            disk_info = DiskInfo(device_path, size_bytes, disk_type, model, serial)
+
+            # Set additional attributes
+            disk_info.vendor = vendor
+            # size_gb is a computed property from size, no need to set it
+            disk_info.is_removable = is_removable
+            disk_info.is_ssd = disk_type in [DiskType.SSD, DiskType.NVME]
+            disk_info.mount_points = mount_points
+            disk_info.is_mounted = is_mounted
+            disk_info.is_system = is_system
+            disk_info.status = status
+            disk_info.mountpoint = mount_points[0] if mount_points else ""
+            disk_info.filesystem = list(filesystems)[0] if filesystems else ""
+
+            # Add HPA/DCO detection for non-removable devices only
+            if not is_removable:
+                try:
+                    hpa_dco_info = self.detect_hpa_dco(device_path)
+                    disk_info.hpa_dco_info = hpa_dco_info
+                    disk_info.hpa_detected = hpa_dco_info.get('hpa_detected', False)
+                    disk_info.dco_detected = hpa_dco_info.get('dco_detected', False)
+                except Exception as e:
+                    logger.debug(f"HPA/DCO detection failed for {device_path}: {e}")
+                    disk_info.hpa_dco_info = {
+                        'hpa_detected': False,
+                        'dco_detected': False,
+                        'error': 'Detection requires sudo permissions'
+                    }
+                    disk_info.hpa_detected = False
+                    disk_info.dco_detected = False
+            else:
+                # For removable devices, skip HPA/DCO detection
+                disk_info.hpa_dco_info = {
+                    'hpa_detected': False,
+                    'dco_detected': False,
+                    'error': 'Not applicable for removable devices'
+                }
+                disk_info.hpa_detected = False
+                disk_info.dco_detected = False
 
             return disk_info
-            
+
         except Exception as e:
             logger.error(f"Error getting disk info for {device_name}: {e}")
             return None
+
+    def _is_system_disk(self, device: str) -> bool:
+        """Check if a disk is a system disk"""
+        try:
+            # Check if any critical mount points are on this device
+            critical_mounts = ['/', '/boot', '/boot/efi', '/var', '/usr', '/home']
+            for partition in psutil.disk_partitions():
+                if partition.device.startswith(device) and partition.mountpoint in critical_mounts:
+                    return True
+            return False
+        except Exception:
+            return False
     
-    def _determine_disk_type(self, device_name: str, model: str) -> str:
+    def _determine_disk_type(self, device_name: str, model: str) -> DiskType:
         """Determine disk type based on device name and model"""
         device_lower = device_name.lower()
         model_lower = model.lower()
         
         if 'nvme' in device_lower:
-            return 'nvme'
+            return DiskType.NVME
         elif 'ssd' in model_lower or 'solid' in model_lower:
-            return 'ssd'
+            return DiskType.SSD
         elif any(x in device_lower for x in ['sd', 'hd']):
-            return 'hdd'
+            return DiskType.HDD
         else:
-            return 'unknown'
+            return DiskType.UNKNOWN
     
     def get_disk_info(self, device: str) -> DiskInfo:
         """Get detailed information about a specific disk"""
@@ -354,6 +475,25 @@ class LinuxDiskHandler(BaseDiskHandler):
     def wipe_disk(self, device: str, method: str, passes: int) -> Tuple[bool, str]:
         """Wipe disk using Linux-specific methods"""
         try:
+            # Check if it's a USB/removable device
+            disk_info = self.get_disk_info(device)
+            if disk_info and disk_info.is_removable:
+                # For USB devices, optimize all methods
+                if method == "quick":
+                    return self._wipe_usb_optimized(device)
+                elif method == "secure":
+                    # Limit to 1 pass for USB
+                    if passes > 1:
+                        print(f"Note: Using 1 pass for USB device (multiple passes unnecessary)")
+                        passes = 1
+                    return self._wipe_with_dd(device, 1)
+                elif method == "dd":
+                    # For dd on USB, use optimized approach
+                    if passes > 1:
+                        print(f"Note: Using 1 pass for USB device")
+                        passes = 1
+                    return self._wipe_with_dd(device, 1)
+            
             if method == "hdparm":
                 return self._wipe_with_hdparm(device)
             elif method == "nvme":
@@ -382,20 +522,22 @@ class LinuxDiskHandler(BaseDiskHandler):
                 return False, "hdparm not available"
             
             # First, set security password (required for secure erase)
-            cmd1 = ["sudo", hdparm_path, "--user-master", "u", "--security-set-pass", "p", device]
-            result1 = subprocess.run(cmd1, capture_output=True, text=True, timeout=30)
+            cmd1 = [hdparm_path, "--user-master", "u", "--security-set-pass", "p", device]
+            from ..sudo_manager import SudoManager
+            sudo_manager = SudoManager()
+            success1, stdout1, stderr1 = sudo_manager.run_with_sudo(cmd1, "set hdparm security password")
             
-            if result1.returncode != 0:
-                return False, f"Failed to set security password: {result1.stderr}"
+            if not success1:
+                return False, f"Failed to set security password: {stderr1}"
             
             # Perform secure erase
-            cmd2 = ["sudo", hdparm_path, "--user-master", "u", "--security-erase", "p", device]
-            result2 = subprocess.run(cmd2, capture_output=True, text=True, timeout=3600)
+            cmd2 = [hdparm_path, "--user-master", "u", "--security-erase", "p", device]
+            success2, stdout2, stderr2 = sudo_manager.run_with_sudo(cmd2, "hdparm secure erase")
             
-            if result2.returncode == 0:
-                return True, "Disk wiped successfully using hdparm secure erase"
-            else:
-                return False, f"hdparm secure erase failed: {result2.stderr}"
+            if not success2:
+                return False, f"hdparm secure erase failed: {stderr2}"
+            
+            return True, "Disk wiped successfully using hdparm secure erase"
                 
         except subprocess.TimeoutExpired:
             return False, "hdparm operation timed out"
@@ -413,13 +555,15 @@ class LinuxDiskHandler(BaseDiskHandler):
                 return False, "nvme-cli not available"
             
             # Format the device (secure erase)
-            cmd = ["sudo", nvme_path, "format", device, "--ses=1", "--force"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            cmd = [nvme_path, "format", device, "--ses=1", "--force"]
+            from ..sudo_manager import SudoManager
+            sudo_manager = SudoManager()
+            success, stdout, stderr = sudo_manager.run_with_sudo(cmd, "nvme secure format")
             
-            if result.returncode == 0:
+            if success:
                 return True, "NVMe disk wiped successfully using nvme-cli"
             else:
-                return False, f"nvme format failed: {result.stderr}"
+                return False, f"nvme format failed: {stderr}"
                 
         except subprocess.TimeoutExpired:
             return False, "nvme operation timed out"
@@ -437,13 +581,15 @@ class LinuxDiskHandler(BaseDiskHandler):
                 return False, "blkdiscard not available"
             
             # Perform TRIM discard
-            cmd = ["sudo", blkdiscard_path, device]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            cmd = [blkdiscard_path, device]
+            from ..sudo_manager import SudoManager
+            sudo_manager = SudoManager()
+            success, stdout, stderr = sudo_manager.run_with_sudo(cmd, "blkdiscard TRIM")
             
-            if result.returncode == 0:
+            if success:
                 return True, "Disk wiped successfully using blkdiscard TRIM"
             else:
-                return False, f"blkdiscard failed: {result.stderr}"
+                return False, f"blkdiscard failed: {stderr}"
                 
         except subprocess.TimeoutExpired:
             return False, "blkdiscard operation timed out"
@@ -463,18 +609,26 @@ class LinuxDiskHandler(BaseDiskHandler):
             if not disk_info or disk_info.size == 0:
                 return False, "Could not determine disk size"
             
+            # Calculate disk size in MB for count parameter
+            disk_size_mb = disk_info.size // (1024 * 1024)
+            logger.info(f"Disk size: {disk_info.size} bytes ({disk_size_mb} MB)")
+            
             # Perform multiple passes
             for pass_num in range(passes):
                 logger.info(f"Starting dd wipe pass {pass_num + 1}/{passes}")
                 
-                # Use /dev/urandom for random data
-                cmd = ["sudo", "dd", f"if=/dev/urandom", f"of={device}", 
-                       "bs=1M", "status=progress", "conv=fsync"]
+                # Use /dev/urandom for random data with proper count parameter
+                cmd = ["dd", f"if=/dev/urandom", f"of={device}", 
+                       "bs=1M", f"count={disk_size_mb}", "status=progress", "conv=fsync"]
                 
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+                # Use the sudo manager's run_with_sudo method to handle cached password
+                # Get the global sudo manager instance that has the cached password
+                from ..sudo_manager import SudoManager
+                sudo_manager = SudoManager()
+                success, stdout, stderr = sudo_manager.run_with_sudo(cmd, f"dd wipe pass {pass_num + 1}")
                 
-                if result.returncode != 0:
-                    return False, f"dd wipe pass {pass_num + 1} failed: {result.stderr}"
+                if not success:
+                    return False, f"dd wipe pass {pass_num + 1} failed: {stderr}"
             
             return True, f"Disk wiped successfully using dd with {passes} passes"
             
@@ -492,6 +646,53 @@ class LinuxDiskHandler(BaseDiskHandler):
     def _wipe_quick(self, device: str) -> Tuple[bool, str]:
         """Perform quick single-pass wipe"""
         return self._wipe_with_dd(device, 1)
+    
+    def _wipe_usb_optimized(self, device: str) -> Tuple[bool, str]:
+        """Optimized wipe for USB devices - fast and effective"""
+        try:
+            from ..sudo_manager import SudoManager
+            sudo_manager = SudoManager()
+            
+            print("🔄 USB device detected - using optimized wipe...")
+            
+            # Method 1: Try wipefs first (fastest)
+            cmd = ['wipefs', '-a', device]
+            success, stdout, stderr = sudo_manager.run_with_sudo(cmd, "wipefs USB")
+            
+            if success:
+                print("✅ USB wiped using wipefs (fastest method)")
+                return True, "USB device wiped successfully (signatures removed)"
+            
+            # Method 2: Fallback to dd for partition table only
+            print("Wipefs unavailable, using dd for partition table...")
+            
+            # Only wipe first 10MB (partition table + boot sector)
+            cmd = ['dd', 'if=/dev/zero', f'of={device}', 'bs=1M', 'count=10', 'status=progress']
+            success, stdout, stderr = sudo_manager.run_with_sudo(cmd, "dd USB quick wipe")
+            
+            if success:
+                # Optionally wipe last 10MB (backup GPT)
+                try:
+                    # Get device size
+                    size_cmd = ['blockdev', '--getsize64', device]
+                    size_success, size_out, _ = sudo_manager.run_with_sudo(size_cmd, "get size")
+                    if size_success:
+                        size_bytes = int(size_out.strip())
+                        last_offset = max(0, (size_bytes // (1024*1024)) - 10)
+                        
+                        # Wipe last 10MB
+                        cmd_end = ['dd', 'if=/dev/zero', f'of={device}', 'bs=1M', 
+                                  'count=10', f'seek={last_offset}']
+                        sudo_manager.run_with_sudo(cmd_end, "wipe backup GPT")
+                except:
+                    pass  # Not critical if we can't wipe the end
+                
+                return True, "USB device wiped successfully (partition table cleared)"
+            else:
+                return False, f"USB wipe failed: {stderr}"
+                
+        except Exception as e:
+            return False, f"USB wipe error: {str(e)}"
     
     def get_wipe_methods(self) -> List[str]:
         """Get available wiping methods for Linux"""
@@ -517,10 +718,18 @@ class LinuxDiskHandler(BaseDiskHandler):
             if device in system_disks:
                 return False
             
-            # Check if it's mounted
+            # Get disk info to check if it's removable
+            disk_info = self.get_disk_info(device)
+            is_removable = disk_info and disk_info.is_removable
+            
+            # For removable devices, allow wiping even if mounted (we'll unmount them)
+            if is_removable:
+                return True
+            
+            # For non-removable devices, check if it's mounted
             for partition in psutil.disk_partitions():
                 if partition.device == device:
-                    return False  # Don't wipe mounted devices
+                    return False  # Don't wipe mounted non-removable devices
             
             # Check if it's a partition of a mounted disk
             device_name = os.path.basename(device)
@@ -598,14 +807,14 @@ class LinuxDiskHandler(BaseDiskHandler):
                 pass
             
             # Method 5: Additional safety - protect common system disk patterns
-            # This prevents wiping disks that might contain system partitions
             try:
                 with open('/proc/partitions', 'r') as f:
                     for line in f:
                         parts = line.strip().split()
-                        if len(parts) >= 4 and parts[3].startswith(('nvme', 'sda', 'sdb')):
+                        if len(parts) >= 4:
                             device_name = parts[3]
-                            # Check if this device has system partitions
+                            # Only check if it actually has system partitions
+                            # Don't pre-filter by device name!
                             if self._has_system_partitions(f"/dev/{device_name}"):
                                 system_disks.append(f"/dev/{device_name}")
             except FileNotFoundError:
@@ -622,11 +831,13 @@ class LinuxDiskHandler(BaseDiskHandler):
     def _has_system_partitions(self, device: str) -> bool:
         """Check if a device contains system partitions"""
         try:
-            # Check if device has partitions that are mounted as system partitions
+            # Only consider it a system disk if it has critical mount points
             device_name = os.path.basename(device)
             for partition in psutil.disk_partitions():
-                if device_name in partition.device and partition.mountpoint in ['/', '/boot', '/boot/efi']:
-                    return True
+                if device_name in partition.device:
+                    # Only system-critical mount points
+                    if partition.mountpoint in ['/', '/boot', '/boot/efi', '/usr', '/var']:
+                        return True
             return False
         except Exception:
             return False

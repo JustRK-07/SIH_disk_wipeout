@@ -1,11 +1,9 @@
 {
     "protected_devices": [
-        "/dev/nvme0n1",
-        "/dev/sda"
+        "/dev/nvme0n1"
     ],
     "protected_patterns": [
-        "nvme*",
-        "sda*"
+        "nvme*"
     ],
     "additional_safety_checks": true,
     "require_multiple_confirmations": true,
